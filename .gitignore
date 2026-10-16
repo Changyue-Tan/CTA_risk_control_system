@@ -1,0 +1,9 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+__pycache__/
+.pytest_cache/
+*.pyc
+reports/
+logs/

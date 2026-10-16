@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CTA 多品种风控与清算</title>
+  <style>
+    :root {
+      --bg: #10151c;
+      --panel: #1a222d;
+      --line: #2c3848;
+      --text: #e7edf5;
+      --muted: #93a0b0;
+      --green: #7dcea0;
+      --red: #f0a0a0;
+      --amber: #e6c07b;
+      --blue: #8eb6e0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Noto Sans CJK SC", "Source Han Sans SC", "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: baseline;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
+    .muted { color: var(--muted); }
+    main { padding: 16px 20px 32px; display: grid; gap: 16px; }
+    .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+    th { color: var(--muted); font-weight: 500; }
+    .pos { color: var(--green); }
+    .neg { color: var(--red); }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+    .NORMAL { background: #1e3a2f; color: var(--green); }
+    .ALERT { background: #3d3420; color: var(--amber); }
+    .RESTRICTED { background: #3d2c20; color: #f0c090; }
+    .HALTED { background: #3d2024; color: var(--red); }
+    form, .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+    label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+    input, select, button {
+      background: #121820;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 8px;
+      font: inherit;
+    }
+    button { cursor: pointer; }
+    button.primary { background: #24344a; }
+    pre {
+      margin: 10px 0 0;
+      padding: 10px;
+      background: #121820;
+      border-radius: 6px;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    @media (max-width: 960px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>CTA 多品种风控与清算</h1>
+      <div class="muted" id="clock">加载中</div>
+    </div>
+    <div class="muted" id="sources"></div>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>账户对比</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>账户</th><th>状态</th><th>权益</th><th>当日盯市</th><th>占比</th>
+            <th>回撤</th><th>保证金</th><th>风险度</th><th>集中度</th><th>可用</th>
+          </tr>
+        </thead>
+        <tbody id="accounts"></tbody>
+      </table>
+    </section>
+    <section class="grid">
+      <div class="panel">
+        <h2>行情</h2>
+        <table>
+          <thead><tr><th>合约</th><th>交易所</th><th>最新</th><th>买价</th><th>卖价</th><th>来源</th></tr></thead>
+          <tbody id="quotes"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2>品种敞口</h2>
+        <table>
+          <thead><tr><th>合约</th><th>多</th><th>空</th><th>净名义</th><th>浮盈</th></tr></thead>
+          <tbody id="board"></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="grid">
+      <div class="panel">
+        <h2>持仓</h2>
+        <table>
+          <thead>
+            <tr><th>账户</th><th>合约</th><th>方向</th><th>手数</th><th>基准价</th><th>最新</th><th>浮盈</th><th>保证金</th></tr>
+          </thead>
+          <tbody id="positions"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2>委托与验收</h2>
+        <form id="order-form">
+          <label>账户<select id="account"></select></label>
+          <label>合约<select id="instrument"></select></label>
+          <label>方向
+            <select id="side"><option value="buy">买</option><option value="sell">卖</option></select>
+          </label>
+          <label>开平
+            <select id="offset"><option value="open">开仓</option><option value="close">平仓</option></select>
+          </label>
+          <label>价格<input id="price" inputmode="decimal" required></label>
+          <label>手数<input id="qty" type="number" min="1" value="1" required></label>
+          <button class="primary" type="submit">提交</button>
+        </form>
+        <div class="actions" style="margin-top:12px">
+          <button type="button" id="shock">熔断验收</button>
+          <button type="button" id="settle">按最新价清算</button>
+          <button type="button" id="resume">解除熔断</button>
+          <button type="button" id="gap">缺口回补演示</button>
+          <button type="button" id="replay">回测样例</button>
+        </div>
+        <pre id="out">等待操作。</pre>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>风控事件</h2>
+      <table>
+        <thead><tr><th>编号</th><th>账户</th><th>级别</th><th>规则</th><th>说明</th></tr></thead>
+        <tbody id="events"></tbody>
+      </table>
+    </section>
+  </main>
+  <script>
+    const statusText = { NORMAL: "正常", ALERT: "预警", RESTRICTED: "限制开仓", HALTED: "熔断" };
+    const out = document.querySelector("#out");
+    let accounts = [];
+    let busy = false;
+
+    function n(value) { return Number(value); }
+    function money(value) {
+      return n(value).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    function pct(value) { return (n(value) * 100).toFixed(2) + "%"; }
+    function cls(value) { return n(value) < 0 ? "neg" : "pos"; }
+    function show(data) { out.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2); }
+
+    function fillSelect(id, values) {
+      const el = document.querySelector(id);
+      const signature = values.join("|");
+      if (el.dataset.signature === signature) return;
+      const prev = el.value;
+      el.dataset.signature = signature;
+      el.innerHTML = values.map((item) => `<option value="${item}">${item}</option>`).join("");
+      if (values.includes(prev)) el.value = prev;
+    }
+
+    function render(data) {
+      document.querySelector("#clock").textContent =
+        `交易日 ${data.trading_day}  ·  公司权益 ${money(data.firm.equity)}  ·  当日盯市 ${money(data.firm.daily_mtm)}  ·  熔断账户 ${data.firm.halted_accounts}`;
+      const market = data.market;
+      const sourceText = (market.sources || []).map((item) =>
+        `${item.name}${item.online ? " 在线" : " 中断"}`
+      ).join("  ·  ");
+      document.querySelector("#sources").textContent =
+        `${sourceText}  ·  价格更新 ${market.applied}  ·  去重 ${market.duplicates}  ·  缺口 ${market.gaps_detected}/${market.gaps_filled}`;
+
+      document.querySelector("#accounts").innerHTML = data.accounts.map((row) => `
+        <tr>
+          <td>${row.account_id}<div class="muted">${row.name}</div></td>
+          <td><span class="pill ${row.status}">${statusText[row.status] || row.status}</span></td>
+          <td>${money(row.equity)}</td>
+          <td class="${cls(row.daily_mtm)}">${money(row.daily_mtm)}</td>
+          <td class="${cls(row.daily_mtm_ratio)}">${pct(row.daily_mtm_ratio)}</td>
+          <td>${pct(row.drawdown)}</td>
+          <td>${money(row.margin)}</td>
+          <td>${pct(row.margin_ratio)}</td>
+          <td>${pct(row.concentration)}</td>
+          <td>${money(row.available)}</td>
+        </tr>`).join("");
+
+      document.querySelector("#quotes").innerHTML = data.quotes.map((row) => `
+        <tr>
+          <td>${row.instrument}</td><td>${row.exchange}</td><td>${row.last}</td>
+          <td>${row.bid}</td><td>${row.ask}</td><td>${row.source}</td>
+        </tr>`).join("");
+      document.querySelector("#board").innerHTML = data.by_instrument.map((row) => `
+        <tr>
+          <td>${row.instrument}</td><td>${row.long_qty}</td><td>${row.short_qty}</td>
+          <td>${money(row.net_notional)}</td>
+          <td class="${cls(row.floating_pnl)}">${money(row.floating_pnl)}</td>
+        </tr>`).join("");
+      document.querySelector("#positions").innerHTML = data.positions.map((row) => `
+        <tr>
+          <td>${row.account_id}</td><td>${row.instrument}</td><td>${row.side}</td><td>${row.qty}</td>
+          <td>${row.prev_settle}</td><td>${row.last}</td>
+          <td class="${cls(row.floating_pnl)}">${money(row.floating_pnl)}</td>
+          <td>${money(row.margin)}</td>
+        </tr>`).join("");
+      document.querySelector("#events").innerHTML = data.events.slice().reverse().map((row) => `
+        <tr>
+          <td>${row.event_id}</td><td>${row.account_id}</td><td>${row.level}</td>
+          <td>${row.rule_id}</td><td style="text-align:left">${row.message}</td>
+        </tr>`).join("");
+
+      accounts = data.accounts;
+      fillSelect("#account", data.accounts.map((row) => row.account_id));
+      fillSelect("#instrument", data.quotes.map((row) => row.instrument));
+      const price = document.querySelector("#price");
+      if (!price.value && data.quotes.length) price.value = data.quotes[0].last;
+    }
+
+    async function refresh() {
+      if (busy) return;
+      busy = true;
+      try {
+        const res = await fetch("/api/snapshot");
+        render(await res.json());
+      } catch (err) {
+        document.querySelector("#clock").textContent = "快照获取失败";
+      } finally {
+        busy = false;
+      }
+    }
+
+    document.querySelector("#order-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const body = {
+        account_id: document.querySelector("#account").value,
+        instrument: document.querySelector("#instrument").value,
+        side: document.querySelector("#side").value,
+        offset: document.querySelector("#offset").value,
+        price: document.querySelector("#price").value,
+        qty: Number(document.querySelector("#qty").value),
+      };
+      const res = await fetch("/api/orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      show(await res.json());
+      refresh();
+    });
+
+    async function post(url) {
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const data = await res.json();
+      show(data);
+      if (data.html_url) window.open(data.html_url, "_blank");
+      refresh();
+    }
+
+    document.querySelector("#shock").addEventListener("click", () => post("/api/demo/circuit-breaker?account_id=gamma"));
+    document.querySelector("#settle").addEventListener("click", () => post("/api/settlement"));
+    document.querySelector("#resume").addEventListener("click", async () => {
+      const account = document.querySelector("#account").value || "gamma";
+      await post(`/api/accounts/${account}/resume`);
+    });
+    document.querySelector("#gap").addEventListener("click", () => post("/api/demo/gap"));
+    document.querySelector("#replay").addEventListener("click", () => post("/api/demo/backtest"));
+    document.querySelector("#instrument").addEventListener("change", () => {
+      const name = document.querySelector("#instrument").value;
+      const row = [...document.querySelectorAll("#quotes tr")].find((tr) => tr.children[0] && tr.children[0].textContent === name);
+      if (row) document.querySelector("#price").value = row.children[2].textContent;
+    });
+
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>

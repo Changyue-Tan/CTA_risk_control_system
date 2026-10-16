@@ -1,0 +1,111 @@
+# 风控参数、品种规则、账户与模拟行情。改这个文件即可，不必改代码。
+trading_day: "2026-07-03"
+
+instruments:
+  rb2510:
+    exchange: SHFE
+    product: rb
+    multiplier: "10"
+    tick_size: "1"
+    margin_rate: "0.09"
+    commission_per_lot: "2"
+  cu2510:
+    exchange: SHFE
+    product: cu
+    multiplier: "5"
+    tick_size: "10"
+    margin_rate: "0.10"
+    commission_per_lot: "4"
+  i2601:
+    exchange: DCE
+    product: i
+    multiplier: "100"
+    tick_size: "0.5"
+    margin_rate: "0.12"
+    commission_per_lot: "3"
+  m2601:
+    exchange: DCE
+    product: m
+    multiplier: "10"
+    tick_size: "1"
+    margin_rate: "0.08"
+    commission_per_lot: "2"
+  IF2510:
+    exchange: CFFEX
+    product: IF
+    multiplier: "300"
+    tick_size: "0.2"
+    margin_rate: "0.12"
+    commission_per_lot: "30"
+  IC2510:
+    exchange: CFFEX
+    product: IC
+    multiplier: "200"
+    tick_size: "0.2"
+    margin_rate: "0.14"
+    commission_per_lot: "30"
+
+accounts:
+  - id: alpha
+    name: 趋势策略Alpha
+    initial_equity: "10000000"
+  - id: beta
+    name: 套利策略Beta
+    initial_equity: "5000000"
+  - id: gamma
+    name: 验收账户Gamma
+    initial_equity: "1000000"
+
+risk:
+  # 单日盯市亏损达到初始资金的 3% 时熔断，禁止该账户继续开仓。
+  daily_loss_circuit_breaker_ratio: "0.03"
+  daily_loss_alert_ratio: "0.015"
+  max_drawdown_alert_ratio: "0.05"
+  max_drawdown_restrict_ratio: "0.08"
+  instrument_margin_alert_ratio: "0.35"
+  instrument_margin_restrict_ratio: "0.50"
+  concentration_alert_ratio: "0.60"
+  concentration_restrict_ratio: "0.80"
+
+# 昨仓。盯市基准为昨结算价，开仓日计为上一交易日。
+bootstrap_positions:
+  - account: alpha
+    instrument: rb2510
+    side: long
+    qty: 30
+    prev_settle: "3450"
+  - account: alpha
+    instrument: i2601
+    side: short
+    qty: 15
+    prev_settle: "780"
+  - account: beta
+    instrument: IF2510
+    side: long
+    qty: 5
+    prev_settle: "3900"
+  - account: beta
+    instrument: IC2510
+    side: short
+    qty: 4
+    prev_settle: "5800"
+  - account: gamma
+    instrument: rb2510
+    side: long
+    qty: 20
+    prev_settle: "3450"
+
+reference_prices:
+  rb2510: "3450"
+  cu2510: "74500"
+  i2601: "780"
+  m2601: "2950"
+  IF2510: "3900"
+  IC2510: "5800"
+
+simulator:
+  enabled: true
+  interval_ms: 1000
+  seed: 7
+  # 每隔 N 拍让主源丢一段序号，下一拍按序号回补。备份源在中断期间继续更新。
+  drop_primary_every: 8
