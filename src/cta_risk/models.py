@@ -21,8 +21,20 @@ class Offset(str, Enum):
     CLOSE = "close"
 
 
+class ActionLevel(str, Enum):
+    ALERT = "alert"
+    RESTRICT = "restrict"
+    HALT = "halt"
+    RECOVERY = "recovery"
+
+
 def money(value: Decimal) -> str:
     return format(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")
+
+
+def pct(value: Decimal) -> str:
+    points = (value * Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return format(points, "f") + "%"
 
 
 def direction(side: PositionSide) -> Decimal:
@@ -55,8 +67,18 @@ class AccountSpec:
 
 @dataclass(frozen=True)
 class RiskLimits:
+    # 当日盯市亏损达到初始资金的这个比例时告警。
+    daily_loss_alert_ratio: Decimal
     # 当日盯市亏损达到初始资金的这个比例时熔断。
     daily_loss_halt_ratio: Decimal
+    # 最大回撤达到这个比例时告警。
+    max_drawdown_alert_ratio: Decimal
+    # 最大回撤达到这个比例时限制开仓。
+    max_drawdown_restrict_ratio: Decimal
+    # 单品种名义敞口占总敞口达到这个比例时告警。
+    concentration_alert_ratio: Decimal
+    # 单品种名义敞口占总敞口达到这个比例时限制加仓。
+    concentration_restrict_ratio: Decimal
     # 单品种名义本金 / 权益 达到这个比例时，禁止继续加该品种。
     max_instrument_notional_ratio: Decimal
 
@@ -126,6 +148,7 @@ class OpenLot:
 class AccountState:
     spec: AccountSpec
     prev_equity: Decimal
+    peak_equity: Decimal
     realized_pnl: Decimal = Decimal(0)
     commission: Decimal = Decimal(0)
     halted: bool = False
@@ -136,4 +159,6 @@ class RiskEvent:
     event_id: str
     account_id: str
     rule_id: str
+    level: ActionLevel
     message: str
+    instrument: str | None = None

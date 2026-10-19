@@ -28,7 +28,12 @@ def make_account(account_id: str = "alpha", equity: str = "1000000", name: str |
 
 def limits(**overrides) -> RiskLimits:
     base = dict(
+        daily_loss_alert_ratio=Decimal("0.02"),
         daily_loss_halt_ratio=Decimal("0.03"),
+        max_drawdown_alert_ratio=Decimal("0.05"),
+        max_drawdown_restrict_ratio=Decimal("0.10"),
+        concentration_alert_ratio=Decimal("0.50"),
+        concentration_restrict_ratio=Decimal("0.70"),
         max_instrument_notional_ratio=Decimal("3"),
     )
     base.update(overrides)

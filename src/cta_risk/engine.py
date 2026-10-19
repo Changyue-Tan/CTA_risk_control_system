@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -11,6 +12,7 @@ from cta_risk.config import project_root
 from cta_risk.market import MarketHub
 from cta_risk.quotes import Quote
 from cta_risk.models import (
+    ActionLevel,
     AccountState,
     Offset,
     OpenLot,
@@ -23,12 +25,23 @@ from cta_risk.models import (
     Tick,
     money,
     mtm_pnl,
+    pct,
 )
 from cta_risk.positions import PositionBook
 from cta_risk.settlement import write_report
 
+logger = logging.getLogger("cta_risk.engine")
+
 HALT_RULE = "daily_loss_circuit_breaker"
+ALERT_DAILY = "daily_loss_alert"
+ALERT_DRAWDOWN = "max_drawdown_alert"
+RESTRICT_DRAWDOWN = "max_drawdown_restrict"
+ALERT_CONCENTRATION = "concentration_alert"
+RESTRICT_CONCENTRATION = "concentration_restrict"
+
 REJECT_HALT = "熔断：账户单日盯市亏损已达初始资金阈值，禁止开仓"
+REJECT_DRAWDOWN = "最大回撤超限，禁止开仓"
+REJECT_CONCENTRATION = "单品种集中度超限，禁止继续加仓"
 REJECT_EXPOSURE = "单品种名义敞口超限，禁止继续加仓"
 REJECT_MARGIN = "可用资金不足，禁止开仓"
 REJECT_POSITION = "可平仓位不足"
@@ -40,6 +53,7 @@ class Metrics:
     daily_mtm: Decimal
     margin: Decimal
     available: Decimal
+    drawdown: Decimal
 
 
 class RiskSystem:
@@ -51,7 +65,8 @@ class RiskSystem:
         self.market = MarketHub()
         self.positions = PositionBook()
         self.accounts = {
-            spec.account_id: AccountState(spec, spec.initial_equity) for spec in config.accounts
+            spec.account_id: AccountState(spec, spec.initial_equity, peak_equity=spec.initial_equity)
+            for spec in config.accounts
         }
         self.events: list[RiskEvent] = []
         self.report_dir = report_dir if report_dir is not None else project_root() / "reports"
@@ -59,18 +74,19 @@ class RiskSystem:
         self._lock = Lock()
         self._ids = count(1)
         self._scenario_seq: dict[str, int] = {}
+        self._active: set[tuple[str, str, str]] = set()
 
         for instrument, price in config.reference_prices.items():
             self.market.seed(instrument, price, self.trading_day)
         for position in config.bootstrap_positions:
             self.positions.bootstrap(position, self.trading_day, self._next("L"))
-        self._halt_on_daily_loss()
+        self._evaluate_risk()
 
     def on_tick(self, tick: Tick) -> bool:
         with self._lock:
             changed = self.market.ingest(tick)
             if changed:
-                self._halt_on_daily_loss()
+                self._evaluate_risk()
             return changed
 
     def publish_quotes(self, quotes: list[Quote]) -> int:
@@ -108,9 +124,16 @@ class RiskSystem:
         with self._lock:
             reason = self._cannot_submit(order)
             if reason:
+                logger.info(
+                    "拒单 %s %s %s: %s",
+                    order.account_id,
+                    order.instrument,
+                    order.offset.value,
+                    reason,
+                )
                 return OrderResult(False, None, reason, None, 0, Decimal(0))
             result = self._fill(order)
-            self._halt_on_daily_loss()
+            self._evaluate_risk()
             return result
 
     def _cannot_submit(self, order: OrderRequest) -> str | None:
@@ -138,6 +161,13 @@ class RiskSystem:
         metrics = self.metrics(order.account_id)
         if metrics.equity <= 0:
             return REJECT_MARGIN
+        if metrics.drawdown >= self.config.risk.max_drawdown_restrict_ratio:
+            return REJECT_DRAWDOWN
+        notionals = self._notionals(order.account_id)
+        if len(notionals) >= 2:
+            top, share = self._top_share(notionals)
+            if top == order.instrument and share >= self.config.risk.concentration_restrict_ratio:
+                return REJECT_CONCENTRATION
         order_notional = order.price * order.qty * spec.multiplier
         held_notional = self.positions.notional(
             order.account_id, order.instrument, self._price_of, self.config.instruments
@@ -189,29 +219,143 @@ class RiskSystem:
             )
         )
 
-    def _halt_on_daily_loss(self) -> None:
-        """当日盯市亏损达到初始资金的阈值时熔断。只在第一次越过阈值时记一条事件。"""
-        limit = self.config.risk.daily_loss_halt_ratio
+    def _evaluate_risk(self) -> None:
+        """逐账户评估告警、限制与熔断。熔断不自动恢复，其余规则回落后发恢复事件。"""
+        limits = self.config.risk
         for account_id, account in self.accounts.items():
             metrics = self.metrics(account_id)
-            breached = metrics.daily_mtm <= -limit * account.spec.initial_equity
-            if breached and not account.halted:
-                account.halted = True
-                self.events.append(
-                    RiskEvent(
-                        self._next("E"),
-                        account_id,
-                        HALT_RULE,
-                        f"单日盯市盈亏 {money(metrics.daily_mtm)}，达到初始资金 {limit * 100}% ，触发熔断",
-                    )
-                )
+            initial = account.spec.initial_equity
+            self._gate(
+                account_id,
+                ALERT_DAILY,
+                "*",
+                metrics.daily_mtm <= -limits.daily_loss_alert_ratio * initial,
+                ActionLevel.ALERT,
+                True,
+                f"单日盯市盈亏 {money(metrics.daily_mtm)}，达到初始资金 {pct(limits.daily_loss_alert_ratio)} 预警线",
+            )
+            self._gate(
+                account_id,
+                HALT_RULE,
+                "*",
+                metrics.daily_mtm <= -limits.daily_loss_halt_ratio * initial,
+                ActionLevel.HALT,
+                False,
+                (
+                    f"单日盯市盈亏 {money(metrics.daily_mtm)}，达到初始资金 "
+                    f"{pct(limits.daily_loss_halt_ratio)}，触发熔断"
+                ),
+                on_enter=lambda acc=account: setattr(acc, "halted", True),
+            )
+            self._gate(
+                account_id,
+                ALERT_DRAWDOWN,
+                "*",
+                metrics.drawdown >= limits.max_drawdown_alert_ratio,
+                ActionLevel.ALERT,
+                True,
+                f"最大回撤 {pct(metrics.drawdown)}，达到预警线 {pct(limits.max_drawdown_alert_ratio)}",
+            )
+            self._gate(
+                account_id,
+                RESTRICT_DRAWDOWN,
+                "*",
+                metrics.drawdown >= limits.max_drawdown_restrict_ratio,
+                ActionLevel.RESTRICT,
+                True,
+                f"最大回撤 {pct(metrics.drawdown)}，禁止继续开仓",
+            )
+            notionals = self._notionals(account_id)
+            if len(notionals) < 2:
+                continue
+            top, share = self._top_share(notionals)
+            if top is None:
+                continue
+            self._gate(
+                account_id,
+                ALERT_CONCENTRATION,
+                top,
+                share >= limits.concentration_alert_ratio,
+                ActionLevel.ALERT,
+                True,
+                f"{top} 名义敞口占比 {pct(share)}，达到集中度预警线",
+            )
+            self._gate(
+                account_id,
+                RESTRICT_CONCENTRATION,
+                top,
+                share >= limits.concentration_restrict_ratio,
+                ActionLevel.RESTRICT,
+                True,
+                f"{top} 名义敞口占比 {pct(share)}，禁止继续加仓该品种",
+            )
+
+    def _gate(
+        self,
+        account_id: str,
+        rule_id: str,
+        instrument: str,
+        breached: bool,
+        level: ActionLevel,
+        auto_clear: bool,
+        message: str,
+        on_enter=None,
+    ) -> None:
+        """按 (账户, 规则, 合约) 去重。越过阈值记一条事件，回落后可记恢复。"""
+        key = (account_id, rule_id, instrument)
+        if breached and key not in self._active:
+            self._active.add(key)
+            if on_enter:
+                on_enter()
+            event = self._emit(account_id, rule_id, level, instrument, message)
+            self._log_event(event)
+        elif not breached and key in self._active and auto_clear:
+            self._active.remove(key)
+            event = self._emit(
+                account_id,
+                rule_id,
+                ActionLevel.RECOVERY,
+                instrument,
+                f"{rule_id} 恢复",
+            )
+            self._log_event(event)
+
+    def _emit(
+        self,
+        account_id: str,
+        rule_id: str,
+        level: ActionLevel,
+        instrument: str,
+        message: str,
+    ) -> RiskEvent:
+        event = RiskEvent(
+            self._next("E"),
+            account_id,
+            rule_id,
+            level,
+            message,
+            None if instrument == "*" else instrument,
+        )
+        self.events.append(event)
+        return event
+
+    def _log_event(self, event: RiskEvent) -> None:
+        if event.level == ActionLevel.HALT:
+            logger.error("熔断 %s %s", event.account_id, event.message)
+        elif event.level == ActionLevel.RESTRICT:
+            logger.warning("限制 %s %s", event.account_id, event.message)
+        elif event.level == ActionLevel.ALERT:
+            logger.warning("告警 %s %s", event.account_id, event.message)
+        else:
+            logger.info("恢复 %s %s", event.account_id, event.message)
 
     def resume(self, account_id: str) -> bool:
         """人工解除熔断。亏损仍超过阈值时会立刻再次熔断。"""
         with self._lock:
             account = self.accounts[account_id]
             account.halted = False
-            self._halt_on_daily_loss()
+            self._active.discard((account_id, HALT_RULE, "*"))
+            self._evaluate_risk()
             return account.halted
 
     def metrics(self, account_id: str) -> Metrics:
@@ -219,7 +363,11 @@ class RiskSystem:
         floating = self.positions.floating(account_id, self._price_of, self.config.instruments)
         margin = self._margin(account_id)
         equity = account.prev_equity + account.realized_pnl + floating - account.commission
-        return Metrics(equity, account.realized_pnl + floating, margin, equity - margin)
+        if equity > account.peak_equity:
+            account.peak_equity = equity
+        peak = account.peak_equity
+        drawdown = (peak - equity) / peak if peak > 0 else Decimal(0)
+        return Metrics(equity, account.realized_pnl + floating, margin, equity - margin, drawdown)
 
     def query_positions(self, account_id: str | None = None, instrument: str | None = None) -> list[dict]:
         with self._lock:
@@ -236,7 +384,12 @@ class RiskSystem:
                 ],
                 "positions": self.positions.rows(None, None, self._price_of, self.config.instruments),
                 "events": [
-                    {"event_id": event.event_id, "account_id": event.account_id, "message": event.message}
+                    {
+                        "event_id": event.event_id,
+                        "account_id": event.account_id,
+                        "level": event.level.value,
+                        "message": event.message,
+                    }
                     for event in self.events
                 ],
             }
@@ -260,6 +413,7 @@ class RiskSystem:
             self.trading_day = day + timedelta(days=1)
             path = self.report_dir / f"risk_report_{day.strftime('%Y%m%d')}.txt"
             write_report(path, day.isoformat(), rows)
+            logger.info("完成 %s 清算，公司权益 %s", day.isoformat(), money(firm_equity))
             return {
                 "trading_day": day.isoformat(),
                 "text_path": str(path),
@@ -300,6 +454,7 @@ class RiskSystem:
             "equity": money(metrics.equity),
             "daily_mtm": money(metrics.daily_mtm),
             "daily_mtm_ratio": format(metrics.daily_mtm / initial, "f") if initial else "0",
+            "drawdown": format(metrics.drawdown, "f"),
             "margin": money(metrics.margin),
             "halted": account.halted,
         }
@@ -332,6 +487,8 @@ class RiskSystem:
         for lot in self.positions.lots_of(account.spec.account_id):
             lot.prev_settle = prices[lot.instrument]
         account.prev_equity = equity
+        if equity > account.peak_equity:
+            account.peak_equity = equity
         account.realized_pnl = Decimal(0)
         account.commission = Decimal(0)
 
@@ -341,6 +498,21 @@ class RiskSystem:
             spec = self.config.instruments[lot.instrument]
             total += self._price_of(lot.instrument) * lot.qty * spec.multiplier * spec.margin_rate
         return total
+
+    def _notionals(self, account_id: str) -> dict[str, Decimal]:
+        result: dict[str, Decimal] = {}
+        for lot in self.positions.lots_of(account_id):
+            spec = self.config.instruments[lot.instrument]
+            gross = self._price_of(lot.instrument) * lot.qty * spec.multiplier
+            result[lot.instrument] = result.get(lot.instrument, Decimal(0)) + gross
+        return result
+
+    def _top_share(self, notionals: dict[str, Decimal]) -> tuple[str | None, Decimal]:
+        total = sum(notionals.values(), Decimal(0))
+        if total <= 0 or not notionals:
+            return None, Decimal(0)
+        top = max(notionals, key=notionals.get)
+        return top, notionals[top] / total
 
     def _price_of(self, instrument: str) -> Decimal:
         return self.market.last[instrument].last

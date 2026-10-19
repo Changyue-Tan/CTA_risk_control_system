@@ -64,7 +64,12 @@ def load_config(path: Path | None = None) -> SystemConfig:
         instruments=instruments,
         accounts=accounts,
         risk=RiskLimits(
+            daily_loss_alert_ratio=_dec(risk["daily_loss_alert_ratio"]),
             daily_loss_halt_ratio=_dec(risk["daily_loss_halt_ratio"]),
+            max_drawdown_alert_ratio=_dec(risk["max_drawdown_alert_ratio"]),
+            max_drawdown_restrict_ratio=_dec(risk["max_drawdown_restrict_ratio"]),
+            concentration_alert_ratio=_dec(risk["concentration_alert_ratio"]),
+            concentration_restrict_ratio=_dec(risk["concentration_restrict_ratio"]),
             max_instrument_notional_ratio=_dec(risk["max_instrument_notional_ratio"]),
         ),
         bootstrap_positions=positions,

@@ -36,7 +36,16 @@ accounts:
     initial_equity: "1000000"
 
 risk:
+  # 当日盯市亏损达到初始资金的 2% 告警，3% 熔断（禁止开仓，平仓仍可）。
+  daily_loss_alert_ratio: "0.02"
   daily_loss_halt_ratio: "0.03"
+  # 相对高水位回撤达到 5% 告警，10% 限制开仓。
+  max_drawdown_alert_ratio: "0.05"
+  max_drawdown_restrict_ratio: "0.10"
+  # 单品种名义敞口占总敞口达到 50% 告警，70% 限制加仓（至少持有两个品种才评估）。
+  concentration_alert_ratio: "0.50"
+  concentration_restrict_ratio: "0.70"
+  # 单品种名义本金 / 权益达到 3 倍时禁止继续加该品种。
   max_instrument_notional_ratio: "3"
 
 # 昨仓。盯市基准是 2026-10-19 的昨结算价（东财行情 zjsj）。

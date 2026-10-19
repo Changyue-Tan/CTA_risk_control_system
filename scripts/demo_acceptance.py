@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 from cta_risk.config import load_config
 from cta_risk.engine import RiskSystem, three_percent_price
 from cta_risk.market import demonstrate_gap
 from cta_risk.models import Offset, OrderRequest, Side
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
 def _yes(flag: bool) -> str:

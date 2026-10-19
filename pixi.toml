@@ -21,4 +21,5 @@ PYTHONPATH = "src"
 [tasks]
 test = "pytest -q"
 demo = "python scripts/demo_acceptance.py"
+backtest = "python scripts/run_backtest.py"
 serve = "uvicorn cta_risk.app:app --host 127.0.0.1 --port 8000"

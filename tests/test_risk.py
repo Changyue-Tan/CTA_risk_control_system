@@ -4,8 +4,18 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from cta_risk.config import load_config
-from cta_risk.engine import HALT_RULE, REJECT_EXPOSURE, REJECT_HALT, REJECT_POSITION, RiskSystem, three_percent_price
-from cta_risk.models import BootstrapPosition, Offset, OrderRequest, PositionSide, Side, Tick
+from cta_risk.engine import (
+    ALERT_DAILY,
+    HALT_RULE,
+    REJECT_CONCENTRATION,
+    REJECT_DRAWDOWN,
+    REJECT_EXPOSURE,
+    REJECT_HALT,
+    REJECT_POSITION,
+    RiskSystem,
+    three_percent_price,
+)
+from cta_risk.models import ActionLevel, BootstrapPosition, Offset, OrderRequest, PositionSide, Side, Tick
 from tests.conftest import instrument, limits, make_account, make_config
 
 
@@ -121,3 +131,72 @@ def test_config_covers_three_exchanges():
     config = load_config()
     assert {item.exchange for item in config.instruments.values()} == {"SHFE", "DCE", "CFFEX"}
     assert config.risk.daily_loss_halt_ratio == Decimal("0.03")
+    assert config.risk.daily_loss_alert_ratio == Decimal("0.02")
+
+
+def test_daily_loss_alert_fires_once_and_recovers():
+    """当日亏损越过 2% 告警线只发一次，价格回到成本后发恢复事件。"""
+    engine = _engine()
+    _move(engine, 1, "2850")
+    assert engine.metrics("gamma").daily_mtm == Decimal("-20000")
+    alerts = [event for event in engine.events if event.rule_id == ALERT_DAILY]
+    assert len(alerts) == 1
+    assert alerts[0].level == ActionLevel.ALERT
+    # 仍在告警区内再跌一点，不应重复告警。
+    _move(engine, 2, "2849", minute=1)
+    assert len([event for event in engine.events if event.rule_id == ALERT_DAILY]) == 1
+    _move(engine, 3, "3050", minute=2)
+    recoveries = [
+        event
+        for event in engine.events
+        if event.rule_id == ALERT_DAILY and event.level == ActionLevel.RECOVERY
+    ]
+    assert len(recoveries) == 1
+    assert engine.accounts["gamma"].halted is False
+
+
+def test_drawdown_restrict_blocks_open():
+    """最大回撤达到限制线时拒绝开仓；当日亏损线故意抬高，避免先触发熔断。"""
+    engine = RiskSystem(
+        make_config(
+            [instrument()],
+            [make_account("alpha", "1000000")],
+            positions=[BootstrapPosition("alpha", "rb2510", PositionSide.LONG, 10, Decimal("3000"))],
+            prices={"rb2510": Decimal("3000")},
+            risk=limits(
+                daily_loss_alert_ratio=Decimal("0.5"),
+                daily_loss_halt_ratio=Decimal("0.5"),
+                max_drawdown_alert_ratio=Decimal("0.02"),
+                max_drawdown_restrict_ratio=Decimal("0.05"),
+            ),
+        )
+    )
+    _move(engine, 1, "2500")
+    assert engine.metrics("alpha").drawdown == Decimal("0.05")
+    opened = engine.submit_order(OrderRequest("alpha", "rb2510", Side.BUY, Offset.OPEN, Decimal("2500"), 1))
+    assert opened.accepted is False
+    assert opened.reject_reason == REJECT_DRAWDOWN
+
+
+def test_concentration_restrict_blocks_add_on_top_instrument():
+    """两品种时，最大敞口占比超过限制线后禁止继续加该品种，允许加小品种。"""
+    engine = RiskSystem(
+        make_config(
+            [
+                instrument(),
+                instrument("i2601", exchange="DCE", multiplier="100", margin_rate="0.12", commission="3"),
+            ],
+            [make_account("alpha", "1000000")],
+            positions=[
+                BootstrapPosition("alpha", "rb2510", PositionSide.LONG, 20, Decimal("3000")),
+                BootstrapPosition("alpha", "i2601", PositionSide.LONG, 1, Decimal("700")),
+            ],
+            prices={"rb2510": Decimal("3000"), "i2601": Decimal("700")},
+            risk=limits(max_instrument_notional_ratio=Decimal("10")),
+        )
+    )
+    blocked = engine.submit_order(OrderRequest("alpha", "rb2510", Side.BUY, Offset.OPEN, Decimal("3000"), 1))
+    assert blocked.accepted is False
+    assert blocked.reject_reason == REJECT_CONCENTRATION
+    allowed = engine.submit_order(OrderRequest("alpha", "i2601", Side.BUY, Offset.OPEN, Decimal("700"), 1))
+    assert allowed.accepted is True

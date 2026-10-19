@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from cta_risk.config import default_config_path, load_config
 from cta_risk.engine import RiskSystem, order_result_dict, three_percent_price
 from cta_risk.models import Offset, OrderRequest, Side, money
 from cta_risk.quotes import fetch_quotes
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 

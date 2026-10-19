@@ -7,11 +7,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
+
+logger = logging.getLogger("cta_risk.quotes")
 
 BEIJING = timezone(timedelta(hours=8))
 SOURCE_SINA = "新浪"
@@ -93,7 +96,9 @@ def _fetch_sina(client: httpx.Client, instruments: list[str], errors: list[str])
         response = client.get(SINA_URL + symbols, headers={"Referer": "https://finance.sina.com.cn"})
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        errors.append(f"新浪行情失败: {exc}")
+        message = f"新浪行情失败: {exc}"
+        logger.warning(message)
+        errors.append(message)
         return []
     return parse_sina(response.content.decode("gbk", errors="replace"))
 
@@ -107,7 +112,9 @@ def _fetch_eastmoney(client: httpx.Client, instruments: list[str], errors: list[
             response.raise_for_status()
             quote = parse_eastmoney(instrument, response.text)
         except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
-            errors.append(f"东财 {instrument} 失败: {exc}")
+            message = f"东财 {instrument} 失败: {exc}"
+            logger.warning(message)
+            errors.append(message)
             continue
         if quote is not None:
             quotes.append(quote)
