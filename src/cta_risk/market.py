@@ -19,12 +19,10 @@ class MarketHub:
     def __init__(self) -> None:
         self.last: dict[str, Tick] = {}
         self.tape: list[Tick] = []
-        # 统计计数器（带 _count 后缀），用于断线回补和去重的演示验证。
+        # 去重和过期回补的观察计数，测试用来确认价格没有被重复改写。
         self.applied_count = 0
         self.duplicate_count = 0
         self.stale_count = 0
-        self.gap_count = 0
-        self.filled_count = 0
         self._seq: dict[tuple[str, str], int] = {}
         self._buffer: dict[tuple[str, str], dict[int, Tick]] = {}
         self._seen_ts: set[tuple[str, datetime]] = set()
@@ -63,7 +61,6 @@ class MarketHub:
             return False
         if tick.seq > expected:
             self._buffer.setdefault(key, {})[tick.seq] = tick
-            self.gap_count += 1
             return False
         return True
 
@@ -74,7 +71,6 @@ class MarketHub:
         nxt = tick.seq + 1
         while nxt in pending:
             changed = self._move_last_price(pending.pop(nxt)) or changed
-            self.filled_count += 1
             nxt += 1
         return changed
 
@@ -96,37 +92,3 @@ class MarketHub:
             self.applied_count += 1
             return True
         return False
-
-
-def demonstrate_gap() -> dict:
-    """主源缺了 4、5 两笔。备份源先顶上，主源再按序号补回，价格不重复更新。"""
-    hub = MarketHub()
-    instrument = "rb2510"
-    day = date(2026, 7, 3)
-    base = datetime(2026, 7, 3, 9, 0, tzinfo=timezone.utc)
-
-    def tick(source: str, seq: int) -> Tick:
-        return Tick(source, instrument, base + timedelta(seconds=seq), seq, Decimal(3450 + seq), day)
-
-    # 1–3：备份先到并改价，主源是同一时间戳，不再改价。
-    for seq in (1, 2, 3):
-        hub.ingest(tick("backup", seq))
-        hub.ingest(tick("primary", seq))
-    # 4–6：只有备份。主源直接跳到 6，先缓存，价格停在备份的 6。
-    for seq in (4, 5, 6):
-        hub.ingest(tick("backup", seq))
-    hub.ingest(tick("primary", 6))
-    before = hub.applied_count
-    # 主源补上 4、5 后放行缓存的 6。这三笔时间都更早，价格保持 3456。
-    hub.ingest(tick("primary", 4))
-    hub.ingest(tick("primary", 5))
-    return {
-        "applied": hub.applied_count,
-        "applied_before_replay": before,
-        "duplicates": hub.duplicate_count,
-        "stale": hub.stale_count,
-        "gaps": hub.gap_count,
-        "filled": hub.filled_count,
-        "last": hub.last[instrument].last,
-        "primary_seqs": [item.seq for item in hub.tape if item.source == "primary"],
-    }

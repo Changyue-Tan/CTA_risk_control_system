@@ -7,5 +7,3 @@
 3. `positions.py`（开平仓与 FIFO）
 4. `engine.py` 的权益公式、`settle` 与 `_roll_to_next_day`
 """
-
-__version__ = "1.0.0"

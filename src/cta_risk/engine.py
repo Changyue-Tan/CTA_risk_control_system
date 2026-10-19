@@ -61,7 +61,7 @@ REJECT_EXPOSURE = "单品种名义敞口超限，禁止继续加仓"
 REJECT_MARGIN = "可用资金不足，禁止开仓"
 REJECT_POSITION = "可平仓位不足"
 
-# set_price 模拟行情时用的数据源名（熔断验收按钮、演示脚本走这条路）。
+# set_price 写入的行情源名称。页面上的「熔断验收」走这条路。
 ACCEPTANCE_SOURCE = "验收"
 
 
@@ -274,16 +274,6 @@ class RiskSystem:
                 order.account_id, order.instrument, order.side, order.qty, order.price, spec.multiplier
             )
             account.realized_pnl += realized
-        self.positions.trades.append(
-            {
-                "account_id": order.account_id,
-                "instrument": order.instrument,
-                "side": order.side.value,
-                "offset": order.offset.value,
-                "qty": order.qty,
-                "price": money(order.price),
-            }
-        )
         return OrderResult(True, self._next("O"), None, order.price, order.qty, realized)
 
     def _open_lot(self, order: OrderRequest) -> None:

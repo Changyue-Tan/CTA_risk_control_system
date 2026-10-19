@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
-from cta_risk.market import MarketHub, demonstrate_gap
+from cta_risk.demo import replay_gap
+from cta_risk.market import MarketHub
 from cta_risk.models import Tick
 
 
@@ -13,15 +14,13 @@ def _tick(source: str, seq: int, price: str, ts: datetime) -> Tick:
 
 def test_gap_replay_does_not_update_the_price_again():
     """主源断档后回补，价格只更新一次。"""
-    result = demonstrate_gap()
-    assert result["applied"] == 6
-    assert result["applied_before_replay"] == 6
-    assert result["duplicates"] == 4
-    assert result["stale"] == 2
-    assert result["gaps"] == 1
-    assert result["filled"] == 1
-    assert result["last"] == Decimal("3456")
-    assert result["primary_seqs"] == [1, 2, 3, 4, 5, 6]
+    gap = replay_gap()
+    assert gap["applied"] == 6
+    assert gap["applied_before_replay"] == 6
+    assert gap["duplicates"] == 4
+    assert gap["stale"] == 2
+    assert gap["last"] == Decimal("3456")
+    assert gap["primary_seqs"] == [1, 2, 3, 4, 5, 6]
 
 
 def test_stale_replay_does_not_move_the_market_backward():

@@ -31,7 +31,6 @@ class PositionBook:
 
     def __init__(self) -> None:
         self.lots: list[OpenLot] = []
-        self.trades: list[dict] = []
 
     def load_prior_positions(self, position: PriorPosition, trading_day: date, lot_id: str) -> None:
         """装入昨仓：开仓日记为上一自然日，盯市基准 = 昨结算。"""

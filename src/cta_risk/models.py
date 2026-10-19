@@ -67,11 +67,6 @@ def direction(side: PositionSide) -> Decimal:
     return Decimal(1) if side == PositionSide.LONG else Decimal(-1)
 
 
-def side_to_close(position_side: PositionSide) -> Side:
-    """平掉这个方向的持仓要下的买卖方向：平多要卖，平空要买。"""
-    return Side.SELL if position_side == PositionSide.LONG else Side.BUY
-
-
 def position_side_to_close(order_side: Side) -> PositionSide:
     """这笔平仓对应的是哪边持仓：卖出平多头，买入平空头（方向相反）。"""
     return PositionSide.LONG if order_side == Side.SELL else PositionSide.SHORT

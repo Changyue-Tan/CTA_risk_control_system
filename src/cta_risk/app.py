@@ -89,7 +89,7 @@ def create_app(engine: RiskSystem | None = None) -> FastAPI:
 
     @app.post("/api/demo/circuit-breaker")
     def circuit_breaker(request: Request):
-        """把 Gamma 的螺纹打到恰好亏掉初始资金 3% 的价格。20 手、乘数 10 时，价格比昨结算低 150 点。"""
+        """把 Gamma 打到恰好亏掉初始资金 3% 的价格，并试一笔开仓和一笔平仓。"""
         engine = request.app.state.engine
         instrument, price = halt_price_at_loss_limit(engine.config)
         engine.set_price(instrument, price)

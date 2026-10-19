@@ -17,7 +17,10 @@
     form, .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
     label { display: grid; gap: 4px; font-size: 12px; color: #93a0b0; }
     input, select, button { background: #121820; color: inherit; border: 1px solid #2c3848; border-radius: 6px; padding: 7px 8px; }
-    pre { background: #121820; padding: 10px; overflow: auto; }
+    .result { background: #121820; border-radius: 6px; padding: 10px 12px; margin-top: 12px; font-size: 13px; }
+    .result p { margin: 0 0 6px; }
+    .result .muted { color: #93a0b0; }
+    .result table { margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -58,7 +61,7 @@
         <button type="button" id="settle">按最新价清算</button>
         <button type="button" id="resume">解除熔断</button>
       </div>
-      <pre id="out">等待操作。</pre>
+      <div id="out" class="result">等待操作。</div>
     </section>
     <section>
       <h2>风控事件</h2>
@@ -69,10 +72,112 @@
     </section>
   </main>
   <script>
-    const sideText = { long: "多", short: "空" };
+    const sideText = { long: "多", short: "空", buy: "买", sell: "卖" };
     const out = document.querySelector("#out");
     const money = (value) => Number(value).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const cls = (value) => Number(value) < 0 ? "neg" : "pos";
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[ch]));
+
+    function renderOrder(data) {
+      if (!data.accepted) {
+        return `<p class="neg">委托被拒绝</p><p>${esc(data.reject_reason)}</p>`;
+      }
+      const pnl = data.realized_pnl;
+      return `<p class="pos">委托已成交 ${esc(data.order_id)}</p>
+        <p>成交价 ${esc(data.fill_price)}　手数 ${esc(data.fill_qty)}　平仓盯市 <span class="${cls(pnl)}">${money(pnl)}</span></p>`;
+    }
+
+    function renderBreaker(data) {
+      const open = data.open_accepted
+        ? `<span class="pos">成交</span>`
+        : `<span class="neg">拒绝</span>　${esc(data.open_reject_reason)}`;
+      const close = data.close_accepted ? `<span class="pos">成交</span>` : `<span class="neg">拒绝</span>`;
+      return `<p>${esc(data.instrument)} 打到 ${esc(data.target_price)}，${data.halted ? "已熔断" : "未熔断"}</p>
+        <p>当日盯市 <span class="${cls(data.daily_mtm)}">${money(data.daily_mtm)}</span></p>
+        <p>开仓　${open}</p>
+        <p>平仓　${close}</p>`;
+    }
+
+    function renderQuotes(data) {
+      const rows = (data.quotes || []).map((quote) => `
+        <tr>
+          <td>${esc(quote.instrument)}</td>
+          <td>${esc(quote.last)}</td>
+          <td>${esc(quote.source)}</td>
+          <td>${esc(String(quote.exchange_ts).replace("T", " ").slice(0, 19))}</td>
+        </tr>`).join("");
+      const errors = (data.errors || []).map((item) => `<p class="neg">${esc(item)}</p>`).join("");
+      const body = rows || `<tr><td colspan="4">没有行情</td></tr>`;
+      return `<p>行情更新 ${esc(data.changed)} 笔</p>
+        <table>
+          <thead><tr><th>合约</th><th>最新</th><th>来源</th><th>交易所时间</th></tr></thead>
+          <tbody>${body}</tbody>
+        </table>${errors}`;
+    }
+
+    function renderSettlement(data) {
+      const rows = data.accounts.map((row) => `
+        <tr>
+          <td>${esc(row.account_id)} ${esc(row.name)}</td>
+          <td>${row.halted ? "熔断" : "正常"}</td>
+          <td>${money(row.equity)}</td>
+          <td class="${cls(row.close_pnl)}">${money(row.close_pnl)}</td>
+          <td class="${cls(row.position_pnl)}">${money(row.position_pnl)}</td>
+          <td>${money(row.margin)}</td>
+        </tr>`).join("");
+      const positions = data.accounts.flatMap((row) => (row.positions || []).map((pos) => `
+        <tr>
+          <td>${esc(row.account_id)}</td>
+          <td>${esc(pos.instrument)}</td>
+          <td>${sideText[pos.side] || esc(pos.side)}</td>
+          <td>${esc(pos.qty)}</td>
+          <td class="${cls(pos.pnl)}">${money(pos.pnl)}</td>
+        </tr>`)).join("");
+      const book = positions
+        ? `<table><thead><tr><th>账户</th><th>合约</th><th>方向</th><th>手数</th><th>盯市</th></tr></thead><tbody>${positions}</tbody></table>`
+        : "";
+      return `<p>清算完成　交易日 ${esc(data.trading_day)}　公司权益 ${money(data.firm_equity)}</p>
+        <p class="muted">日报 ${esc(data.text_path)}</p>
+        <table>
+          <thead><tr><th>账户</th><th>状态</th><th>权益</th><th>平仓盯市</th><th>持仓盯市</th><th>保证金</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>${book}`;
+    }
+
+    function renderResume(data) {
+      const text = data.halted ? "仍处于熔断" : "已解除熔断";
+      return `<p>${esc(data.account_id)} ${text}</p>`;
+    }
+
+    function showResult(data) {
+      if (data.detail) {
+        out.innerHTML = `<p class="neg">${esc(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail))}</p>`;
+        return;
+      }
+      if ("open_accepted" in data) {
+        out.innerHTML = renderBreaker(data);
+        return;
+      }
+      if (data.quotes) {
+        out.innerHTML = renderQuotes(data);
+        return;
+      }
+      if (data.firm_equity !== undefined && data.accounts) {
+        out.innerHTML = renderSettlement(data);
+        return;
+      }
+      if ("accepted" in data) {
+        out.innerHTML = renderOrder(data);
+        return;
+      }
+      if (data.account_id && "halted" in data) {
+        out.innerHTML = renderResume(data);
+        return;
+      }
+      out.textContent = "无法显示该结果。";
+    }
 
     function fillSelect(id, values) {
       const el = document.querySelector(id);
@@ -121,7 +226,7 @@
 
     async function post(url) {
       const response = await fetch(url, { method: "POST" });
-      out.textContent = JSON.stringify(await response.json(), null, 2);
+      showResult(await response.json());
       refresh();
     }
 
@@ -139,7 +244,7 @@
           qty: Number(document.querySelector("#qty").value),
         }),
       });
-      out.textContent = JSON.stringify(await response.json(), null, 2);
+      showResult(await response.json());
       refresh();
     });
     document.querySelector("#live").addEventListener("click", () => post("/api/quotes"));
