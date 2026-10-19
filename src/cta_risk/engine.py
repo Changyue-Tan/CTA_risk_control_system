@@ -20,6 +20,7 @@ from decimal import Decimal
 from itertools import count
 from pathlib import Path
 from threading import Lock
+from typing import Callable
 
 from cta_risk.config import project_root
 from cta_risk.market import MarketHub
@@ -33,6 +34,7 @@ from cta_risk.models import (
     OrderResult,
     PositionSide,
     RiskEvent,
+    RiskLimits,
     Side,
     SystemConfig,
     Tick,
@@ -78,6 +80,61 @@ class Metrics:
     available: Decimal
     # 相对历史权益高水位的回撤比例，0.10 表示回撤了 10%。
     drawdown: Decimal
+
+
+@dataclass(frozen=True)
+class RiskRule:
+    """一条账户级风控规则。`_evaluate_risk` 逐账户 × 逐规则调用 `_gate`。
+
+    - `breached(metrics, limits, account)`：当前是否越过阈值
+    - `message(metrics, limits, account)`：越线时记入事件的中文说明
+    - `halt=True` 表示熔断：越线时置 `halted`，且不自动恢复（其余规则回落后发恢复事件）
+    """
+
+    rule_id: str
+    level: ActionLevel
+    halt: bool
+    breached: Callable[[Metrics, RiskLimits, AccountState], bool]
+    message: Callable[[Metrics, RiskLimits, AccountState], str]
+
+
+# 账户级规则全集。集中度规则涉及“哪个品种”，单独在 _evaluate_risk 里处理。
+ACCOUNT_RULES: tuple[RiskRule, ...] = (
+    RiskRule(
+        ALERT_DAILY,
+        ActionLevel.ALERT,
+        halt=False,
+        breached=lambda m, lim, acc: m.daily_mtm <= -lim.daily_loss_alert_ratio * acc.spec.initial_equity,
+        message=lambda m, lim, acc: (
+            f"单日盯市盈亏 {money(m.daily_mtm)}，达到初始资金 {pct(lim.daily_loss_alert_ratio)} 预警线"
+        ),
+    ),
+    RiskRule(
+        HALT_RULE,
+        ActionLevel.HALT,
+        halt=True,
+        breached=lambda m, lim, acc: m.daily_mtm <= -lim.daily_loss_halt_ratio * acc.spec.initial_equity,
+        message=lambda m, lim, acc: (
+            f"单日盯市盈亏 {money(m.daily_mtm)}，达到初始资金 {pct(lim.daily_loss_halt_ratio)}，触发熔断"
+        ),
+    ),
+    RiskRule(
+        ALERT_DRAWDOWN,
+        ActionLevel.ALERT,
+        halt=False,
+        breached=lambda m, lim, acc: m.drawdown >= lim.max_drawdown_alert_ratio,
+        message=lambda m, lim, acc: (
+            f"最大回撤 {pct(m.drawdown)}，达到预警线 {pct(lim.max_drawdown_alert_ratio)}"
+        ),
+    ),
+    RiskRule(
+        RESTRICT_DRAWDOWN,
+        ActionLevel.RESTRICT,
+        halt=False,
+        breached=lambda m, lim, acc: m.drawdown >= lim.max_drawdown_restrict_ratio,
+        message=lambda m, lim, acc: f"最大回撤 {pct(m.drawdown)}，禁止继续开仓",
+    ),
+)
 
 
 class RiskSystem:
@@ -251,84 +308,61 @@ class RiskSystem:
         limits = self.config.risk
         for account_id, account in self.accounts.items():
             metrics = self.metrics(account_id)
-            initial = account.spec.initial_equity
-            self._gate(
-                account_id,
-                ALERT_DAILY,
-                "*",
-                metrics.daily_mtm <= -limits.daily_loss_alert_ratio * initial,
-                ActionLevel.ALERT,
-                True,
-                f"单日盯市盈亏 {money(metrics.daily_mtm)}，达到初始资金 {pct(limits.daily_loss_alert_ratio)} 预警线",
-            )
-            self._gate(
-                account_id,
-                HALT_RULE,
-                "*",
-                metrics.daily_mtm <= -limits.daily_loss_halt_ratio * initial,
-                ActionLevel.HALT,
-                False,
-                (
-                    f"单日盯市盈亏 {money(metrics.daily_mtm)}，达到初始资金 "
-                    f"{pct(limits.daily_loss_halt_ratio)}，触发熔断"
-                ),
-                on_enter=lambda acc=account: setattr(acc, "halted", True),
-            )
-            self._gate(
-                account_id,
-                ALERT_DRAWDOWN,
-                "*",
-                metrics.drawdown >= limits.max_drawdown_alert_ratio,
-                ActionLevel.ALERT,
-                True,
-                f"最大回撤 {pct(metrics.drawdown)}，达到预警线 {pct(limits.max_drawdown_alert_ratio)}",
-            )
-            self._gate(
-                account_id,
-                RESTRICT_DRAWDOWN,
-                "*",
-                metrics.drawdown >= limits.max_drawdown_restrict_ratio,
-                ActionLevel.RESTRICT,
-                True,
-                f"最大回撤 {pct(metrics.drawdown)}，禁止继续开仓",
-            )
-            notionals = self._notionals(account_id)
-            if len(notionals) < 2:
-                continue
-            top, share = self._top_share(notionals)
-            if top is None:
-                continue
-            self._gate(
-                account_id,
-                ALERT_CONCENTRATION,
-                top,
-                share >= limits.concentration_alert_ratio,
-                ActionLevel.ALERT,
-                True,
-                f"{top} 名义敞口占比 {pct(share)}，达到集中度预警线",
-            )
-            self._gate(
-                account_id,
-                RESTRICT_CONCENTRATION,
-                top,
-                share >= limits.concentration_restrict_ratio,
-                ActionLevel.RESTRICT,
-                True,
-                f"{top} 名义敞口占比 {pct(share)}，禁止继续加仓该品种",
-            )
+            # 账户级规则：当日亏损、回撤。数据来自 ACCOUNT_RULES 表。
+            for rule in ACCOUNT_RULES:
+                self._gate(
+                    account_id,
+                    rule.rule_id,
+                    "*",
+                    breached=rule.breached(metrics, limits, account),
+                    level=rule.level,
+                    auto_clear=not rule.halt,
+                    message=rule.message(metrics, limits, account),
+                    on_enter=lambda acc=account: setattr(acc, "halted", True) if rule.halt else None,
+                )
+            # 集中度规则：和「哪个品种」绑定，单独处理。
+            self._evaluate_concentration(account_id, metrics, limits)
+
+    def _evaluate_concentration(self, account_id: str, metrics: Metrics, limits: RiskLimits) -> None:
+        """单品种名义敞口占比。至少持有两个品种才评估。"""
+        notionals = self._notionals(account_id)
+        if len(notionals) < 2:
+            return
+        top, share = self._top_share(notionals)
+        if top is None:
+            return
+        self._gate(
+            account_id,
+            ALERT_CONCENTRATION,
+            top,
+            breached=share >= limits.concentration_alert_ratio,
+            level=ActionLevel.ALERT,
+            auto_clear=True,
+            message=f"{top} 名义敞口占比 {pct(share)}，达到集中度预警线",
+        )
+        self._gate(
+            account_id,
+            RESTRICT_CONCENTRATION,
+            top,
+            breached=share >= limits.concentration_restrict_ratio,
+            level=ActionLevel.RESTRICT,
+            auto_clear=True,
+            message=f"{top} 名义敞口占比 {pct(share)}，禁止继续加仓该品种",
+        )
 
     def _gate(
         self,
         account_id: str,
         rule_id: str,
         instrument: str,
+        *,
         breached: bool,
         level: ActionLevel,
         auto_clear: bool,
         message: str,
-        on_enter=None,
+        on_enter: Callable[[], None] | None = None,
     ) -> None:
-        """按 (账户, 规则, 合约) 去重。越过阈值记一条事件，回落后可记恢复。"""
+        """按 (账户, 规则, 合约) 去重。越过阈值记一条事件；`auto_clear` 为真时回落记恢复。"""
         key = (account_id, rule_id, instrument)
         if breached and key not in self._active:
             self._active.add(key)
