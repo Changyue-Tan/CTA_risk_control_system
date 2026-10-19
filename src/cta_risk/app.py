@@ -1,83 +1,22 @@
 from __future__ import annotations
 
-import logging
-import threading
-from contextlib import asynccontextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
-from cta_risk.backtest import builtin_demo
-from cta_risk.config import default_config_path, load_config, project_root
-from cta_risk.engine import RiskSystem, order_result_dict
-from cta_risk.market import LiveFeed, run_gap_demo
-from cta_risk.models import Offset, OrderRequest, Side
+from cta_risk.config import default_config_path, load_config
+from cta_risk.engine import RiskSystem, order_result_dict, three_percent_price
+from cta_risk.models import Offset, OrderRequest, Side, money
+from cta_risk.quotes import fetch_quotes
 
-logger = logging.getLogger("cta_risk.app")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
-def configure_logging() -> None:
-    log_dir = project_root() / "logs"
-    log_dir.mkdir(exist_ok=True)
-    root = logging.getLogger()
-    if root.handlers:
-        return
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(log_dir / "risk.log", encoding="utf-8"),
-        ],
-    )
-
-
-def start_background_feed(engine: RiskSystem) -> threading.Event:
-    prices = {name: engine.market.latest[name].last for name in engine.config.reference_prices}
-    feed = LiveFeed(
-        engine.config.instruments,
-        prices,
-        engine.trading_day,
-        engine.config.simulator.seed,
-        engine.config.simulator.drop_primary_every,
-    )
-    engine.bind_feed(feed)
-    stop = threading.Event()
-    interval = engine.config.simulator.interval_ms / 1000
-
-    def loop() -> None:
-        while not stop.wait(interval):
-            try:
-                engine.apply_feed_actions(feed.next_actions())
-            except Exception:
-                logger.exception("模拟行情步进失败")
-
-    threading.Thread(target=loop, name="market-feed", daemon=True).start()
-    return stop
-
-
 def create_app(engine: RiskSystem | None = None) -> FastAPI:
-    configure_logging()
-    system = engine or RiskSystem(load_config(default_config_path()))
-    system.report_dir.mkdir(parents=True, exist_ok=True)
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        stop = None
-        if app.state.engine.config.simulator.enabled:
-            stop = start_background_feed(app.state.engine)
-            logger.info("双源模拟行情已启动")
-        yield
-        if stop is not None:
-            stop.set()
-
-    app = FastAPI(title="CTA 多品种风控与清算", lifespan=lifespan)
-    app.state.engine = system
-    app.mount("/reports", StaticFiles(directory=system.report_dir), name="reports")
+    app = FastAPI(title="CTA 多品种风控与清算")
+    app.state.engine = engine or RiskSystem(load_config(default_config_path()))
 
     @app.get("/")
     def index():
@@ -93,60 +32,76 @@ def create_app(engine: RiskSystem | None = None) -> FastAPI:
 
     @app.get("/api/positions")
     def positions(request: Request, account_id: str | None = None, instrument: str | None = None):
-        rows = request.app.state.engine.query_positions(account_id, instrument)
-        return {"positions": rows}
+        return {"positions": request.app.state.engine.query_positions(account_id, instrument)}
 
     @app.post("/api/orders")
     def orders(request: Request, body: dict):
         try:
             order = OrderRequest(
-                account_id=str(body["account_id"]),
-                instrument=str(body["instrument"]),
-                side=Side(str(body["side"])),
-                offset=Offset(str(body["offset"])),
-                price=Decimal(str(body["price"])),
-                qty=int(body["qty"]),
+                str(body["account_id"]),
+                str(body["instrument"]),
+                Side(str(body["side"])),
+                Offset(str(body["offset"])),
+                Decimal(str(body["price"])),
+                int(body["qty"]),
             )
         except (KeyError, ValueError, InvalidOperation) as exc:
             return JSONResponse({"accepted": False, "reject_reason": f"委托字段无效: {exc}"}, status_code=400)
-        result = request.app.state.engine.submit_order(order)
-        return order_result_dict(result)
+        return order_result_dict(request.app.state.engine.submit_order(order))
 
     @app.post("/api/settlement")
-    def settlement(request: Request, body: dict | None = None):
-        engine_ = request.app.state.engine
-        raw = (body or {}).get("prices")
+    def settlement(request: Request):
+        engine = request.app.state.engine
         try:
-            if raw:
-                prices = {name: Decimal(str(price)) for name, price in raw.items()}
-            else:
-                prices = engine_.last_prices()
-            report = engine_.settle(prices)
-        except (ValueError, InvalidOperation, KeyError) as exc:
+            return engine.settle(engine.last_prices())
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return report
 
     @app.post("/api/accounts/{account_id}/resume")
     def resume(account_id: str, request: Request):
-        try:
-            return request.app.state.engine.resume(account_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if account_id not in request.app.state.engine.accounts:
+            raise HTTPException(status_code=404, detail="账户不存在")
+        halted = request.app.state.engine.resume(account_id)
+        return {"account_id": account_id, "halted": halted}
+
+    @app.post("/api/quotes")
+    def quotes(request: Request):
+        """从新浪和东财各拉一次最新价。同一时间戳不会触发第二次熔断。"""
+        engine = request.app.state.engine
+        batch = fetch_quotes(list(engine.config.instruments))
+        changed = engine.publish_quotes(batch.quotes)
+        return {
+            "changed": changed,
+            "quotes": [
+                {
+                    "source": quote.source,
+                    "instrument": quote.instrument,
+                    "last": format(quote.last, "f"),
+                    "exchange_ts": quote.exchange_ts.isoformat(),
+                }
+                for quote in batch.quotes
+            ],
+            "errors": batch.errors,
+        }
 
     @app.post("/api/demo/circuit-breaker")
-    def circuit_breaker(request: Request, account_id: str = "gamma", instrument: str = "rb2510"):
-        try:
-            return request.app.state.engine.acceptance_shock(account_id, instrument)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/demo/gap")
-    def gap_demo():
-        return run_gap_demo()
-
-    @app.post("/api/demo/backtest")
-    def backtest_demo():
-        return builtin_demo()
+    def circuit_breaker(request: Request):
+        """把 Gamma 的螺纹打到恰好亏掉初始资金 3% 的价格。20 手、乘数 10 时，价格比昨结算低 150 点。"""
+        engine = request.app.state.engine
+        instrument, price = three_percent_price(engine.config)
+        engine.set_price(instrument, price)
+        metrics = engine.metrics("gamma")
+        opened = engine.submit_order(OrderRequest("gamma", instrument, Side.BUY, Offset.OPEN, price, 1))
+        closed = engine.submit_order(OrderRequest("gamma", instrument, Side.SELL, Offset.CLOSE, price, 1))
+        return {
+            "instrument": instrument,
+            "target_price": format(price, "f"),
+            "daily_mtm": money(metrics.daily_mtm),
+            "halted": engine.accounts["gamma"].halted,
+            "open_accepted": opened.accepted,
+            "open_reject_reason": opened.reject_reason,
+            "close_accepted": closed.accepted,
+        }
 
     return app
 

@@ -9,9 +9,8 @@ from cta_risk.models import (
     InstrumentSpec,
     OpenLot,
     PositionSide,
-    PositionView,
     Side,
-    Trade,
+    money,
     mtm_pnl,
 )
 
@@ -21,14 +20,9 @@ class PositionBook:
 
     def __init__(self) -> None:
         self.lots: list[OpenLot] = []
-        self.trades: list[Trade] = []
-
-    def add_lot(self, lot: OpenLot) -> None:
-        self.lots.append(lot)
+        self.trades: list[dict] = []
 
     def bootstrap(self, position: BootstrapPosition, trading_day: date, lot_id: str) -> None:
-        if position.qty <= 0:
-            raise ValueError("昨仓手数必须大于 0")
         self.lots.append(
             OpenLot(
                 lot_id=lot_id,
@@ -42,36 +36,25 @@ class PositionBook:
             )
         )
 
-    def position_qty(self, account_id: str, instrument: str, side: PositionSide) -> int:
+    def qty(self, account_id: str, instrument: str, side: PositionSide) -> int:
         return sum(
             lot.qty
             for lot in self.lots
             if lot.account_id == account_id and lot.instrument == instrument and lot.side == side
         )
 
-    def close(
-        self,
-        account_id: str,
-        instrument: str,
-        order_side: Side,
-        qty: int,
-        price: Decimal,
-        multiplier: Decimal,
-    ) -> Decimal:
-        """卖平多、买平空。返回本笔平仓盯市盈亏。"""
-        position_side = PositionSide.LONG if order_side == Side.SELL else PositionSide.SHORT
-        candidates = [
+    def close(self, account_id: str, instrument: str, order_side: Side, qty: int, price: Decimal, multiplier: Decimal) -> Decimal:
+        """卖出平多头，买入平空头。返回这笔平仓的盯市盈亏。"""
+        side = PositionSide.LONG if order_side == Side.SELL else PositionSide.SHORT
+        lots = [
             lot
             for lot in self.lots
-            if lot.account_id == account_id
-            and lot.instrument == instrument
-            and lot.side == position_side
-            and lot.qty > 0
+            if lot.account_id == account_id and lot.instrument == instrument and lot.side == side
         ]
-        candidates.sort(key=lambda lot: (lot.open_day, lot.lot_id))
+        lots.sort(key=lambda lot: (lot.open_day, lot.lot_id))
         remain = qty
         pnl = Decimal(0)
-        for lot in candidates:
+        for lot in lots:
             take = min(lot.qty, remain)
             pnl += mtm_pnl(lot.side, price, lot.prev_settle, take, multiplier)
             lot.qty -= take
@@ -85,32 +68,22 @@ class PositionBook:
 
     def floating(self, account_id: str, price_of, instruments: dict[str, InstrumentSpec]) -> Decimal:
         total = Decimal(0)
-        for lot in self.lots:
-            if lot.account_id != account_id:
-                continue
+        for lot in self.lots_of(account_id):
             spec = instruments[lot.instrument]
             total += mtm_pnl(lot.side, price_of(lot.instrument), lot.prev_settle, lot.qty, spec.multiplier)
         return total
 
-    def margin_and_notional(
-        self,
-        account_id: str,
-        price_of,
-        instruments: dict[str, InstrumentSpec],
-    ) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
-        margin: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
-        notional: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
-        for lot in self.lots:
-            if lot.account_id != account_id:
+    def notional(self, account_id: str, instrument: str, price_of, instruments: dict[str, InstrumentSpec]) -> Decimal:
+        total = Decimal(0)
+        for lot in self.lots_of(account_id):
+            if lot.instrument != instrument:
                 continue
-            spec = instruments[lot.instrument]
-            price = price_of(lot.instrument)
-            value = price * lot.qty * spec.multiplier
-            notional[lot.instrument] += value
-            margin[lot.instrument] += value * spec.margin_rate
-        return dict(margin), dict(notional)
+            spec = instruments[instrument]
+            total += price_of(instrument) * lot.qty * spec.multiplier
+        return total
 
-    def views(self, account_id: str | None, instrument: str | None, price_of, instruments) -> list[PositionView]:
+    def rows(self, account_id: str | None, instrument: str | None, price_of, instruments) -> list[dict]:
+        """按账户、合约、方向汇总，直接返回页面和接口用的一行。"""
         grouped: dict[tuple[str, str, PositionSide], list[OpenLot]] = defaultdict(list)
         for lot in self.lots:
             if account_id and lot.account_id != account_id:
@@ -119,30 +92,29 @@ class PositionBook:
                 continue
             grouped[(lot.account_id, lot.instrument, lot.side)].append(lot)
 
-        rows: list[PositionView] = []
+        rows = []
         for (acc, inst, side), lots in sorted(grouped.items()):
             spec = instruments[inst]
             qty = sum(lot.qty for lot in lots)
             last = price_of(inst)
-            open_amount = sum(lot.open_price * lot.qty for lot in lots)
-            basis_amount = sum(lot.prev_settle * lot.qty for lot in lots)
+            basis = sum((lot.prev_settle * lot.qty for lot in lots), Decimal(0)) / qty
             floating = sum(mtm_pnl(side, last, lot.prev_settle, lot.qty, spec.multiplier) for lot in lots)
             gross = last * qty * spec.multiplier
             rows.append(
-                PositionView(
-                    account_id=acc,
-                    instrument=inst,
-                    exchange=spec.exchange,
-                    product=spec.product,
-                    side=side,
-                    qty=qty,
-                    open_price=open_amount / qty,
-                    prev_settle=basis_amount / qty,
-                    last=last,
-                    multiplier=spec.multiplier,
-                    floating_pnl=floating,
-                    margin=gross * spec.margin_rate,
-                    notional=gross,
-                )
+                {
+                    "account_id": acc,
+                    "instrument": inst,
+                    "exchange": spec.exchange,
+                    "side": side.value,
+                    "qty": qty,
+                    "prev_settle": format(basis, "f"),
+                    "last": format(last, "f"),
+                    "floating_pnl": money(floating),
+                    "margin": money(gross * spec.margin_rate),
+                    "notional": money(gross),
+                }
             )
         return rows
+
+    def lots_of(self, account_id: str) -> list[OpenLot]:
+        return [lot for lot in self.lots if lot.account_id == account_id]

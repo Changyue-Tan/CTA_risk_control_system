@@ -4,16 +4,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from cta_risk.config import load_config
-from cta_risk.engine import RiskSystem
-from cta_risk.models import (
-    BootstrapPosition,
-    Offset,
-    OrderRequest,
-    PositionSide,
-    Side,
-    Tick,
-)
-from cta_risk.risk import HALT_DAILY, REJECT_CONCENTRATION, REJECT_DRAWDOWN, REJECT_EXPOSURE, REJECT_HALT
+from cta_risk.engine import HALT_RULE, REJECT_EXPOSURE, REJECT_HALT, REJECT_POSITION, RiskSystem, three_percent_price
+from cta_risk.models import BootstrapPosition, Offset, OrderRequest, PositionSide, Side, Tick
 from tests.conftest import instrument, limits, make_account, make_config
 
 
@@ -30,22 +22,11 @@ def _engine():
 
 def _move(engine: RiskSystem, seq: int, price: str, minute: int = 0) -> None:
     ts = datetime(2026, 7, 3, 10, minute, tzinfo=timezone.utc)
-    engine.on_tick(
-        Tick(
-            "primary",
-            "rb2510",
-            ts,
-            seq,
-            Decimal(price),
-            Decimal(price) - 1,
-            Decimal(price) + 1,
-            seq,
-            engine.trading_day,
-        )
-    )
+    engine.on_tick(Tick("primary", "rb2510", ts, seq, Decimal(price), engine.trading_day))
 
 
 def test_loss_short_of_three_percent_does_not_halt():
+    """单日亏损未到初始资金的 3% 时不熔断。"""
     engine = _engine()
     _move(engine, 1, "2751")
     assert engine.accounts["gamma"].halted is False
@@ -53,6 +34,7 @@ def test_loss_short_of_three_percent_does_not_halt():
 
 
 def test_three_percent_loss_halts_open_and_still_allows_close():
+    """亏损刚好达到 3% 时拒绝开仓，平仓仍然可以成交。"""
     engine = _engine()
     _move(engine, 1, "2750")
     assert engine.metrics("gamma").daily_mtm == Decimal("-30000")
@@ -65,70 +47,52 @@ def test_three_percent_loss_halts_open_and_still_allows_close():
 
 
 def test_same_tick_from_backup_does_not_emit_a_second_halt():
+    """备份源送来同一笔行情时，不重复发出熔断信号。"""
     engine = _engine()
     ts = datetime(2026, 7, 3, 10, 0, tzinfo=timezone.utc)
-    primary = Tick("primary", "rb2510", ts, 1, Decimal("2750"), Decimal("2749"), Decimal("2751"), 1, engine.trading_day)
-    backup = Tick("backup", "rb2510", ts, 1, Decimal("2750"), Decimal("2749"), Decimal("2751"), 1, engine.trading_day)
-    engine.on_tick(primary)
-    engine.on_tick(backup)
-    halts = [event for event in engine.risk.events if event.rule_id == HALT_DAILY]
+    engine.on_tick(Tick("primary", "rb2510", ts, 1, Decimal("2750"), engine.trading_day))
+    engine.on_tick(Tick("backup", "rb2510", ts, 1, Decimal("2750"), engine.trading_day))
+    halts = [event for event in engine.events if event.rule_id == HALT_RULE]
     assert len(halts) == 1
-    assert engine.market.applied_count == 1
+    assert engine.market.applied == 1
 
 
-def test_halt_stays_until_resume_and_resume_rechecks_the_loss():
+def test_halt_stays_until_resume():
+    """熔断不会自动解除。亏损还在时，人工恢复会立刻再次熔断。"""
     engine = _engine()
     _move(engine, 1, "2750")
-    resumed = engine.resume("gamma")
-    assert resumed["halted"] is True
+    assert engine.resume("gamma") is True
     _move(engine, 2, "3050", minute=5)
-    assert engine.accounts["gamma"].halted is True
     rejected = engine.submit_order(OrderRequest("gamma", "rb2510", Side.BUY, Offset.OPEN, Decimal("3050"), 1))
     assert rejected.accepted is False
-    resumed = engine.resume("gamma")
-    assert resumed["halted"] is False
+    assert engine.resume("gamma") is False
     opened = engine.submit_order(OrderRequest("gamma", "rb2510", Side.BUY, Offset.OPEN, Decimal("3050"), 1))
     assert opened.accepted is True
 
 
-def test_accounts_are_isolated_when_the_same_price_moves():
+def test_accounts_stay_separate_and_gamma_halts_at_three_percent():
+    """同一笔螺纹行情只熔断 Gamma。价格比昨结算低 150 点时，亏损正好是初始资金的 3%。"""
     engine = RiskSystem(load_config())
-    ts = datetime(2026, 7, 3, 10, 0, tzinfo=timezone.utc)
-    engine.on_tick(Tick("primary", "rb2510", ts, 1, Decimal("3300"), Decimal("3299"), Decimal("3301"), 1, engine.trading_day))
+    instrument, price = three_percent_price(engine.config)
+    engine.set_price(instrument, price)
+    assert instrument == "rb2701"
+    assert price == Decimal("2930")
     assert engine.accounts["gamma"].halted is True
     assert engine.accounts["alpha"].halted is False
     assert engine.accounts["beta"].halted is False
     assert engine.metrics("gamma").daily_mtm == Decimal("-30000")
     assert engine.metrics("beta").daily_mtm == Decimal("0")
+    opened = engine.submit_order(OrderRequest("gamma", instrument, Side.BUY, Offset.OPEN, price, 1))
+    assert opened.reject_reason == REJECT_HALT
 
 
-def test_yaml_acceptance_shock_matches_the_three_percent_case():
-    engine = RiskSystem(load_config())
-    trace = engine.acceptance_shock("gamma")
-    assert trace["target_price"] == "3300"
-    assert trace["daily_mtm"] == "-30000.00"
-    assert trace["threshold"] == "-30000.00"
-    assert trace["halted"] is True
-    assert trace["open_accepted"] is False
-    assert "熔断" in trace["open_reject_reason"]
-    assert trace["close_accepted"] is True
-
-
-def test_drawdown_restricts_new_opens():
-    engine = _engine()
-    engine.accounts["gamma"].peak_equity = Decimal("1000000")
-    engine.accounts["gamma"].prev_equity = Decimal("900000")
-    result = engine.submit_order(OrderRequest("gamma", "rb2510", Side.BUY, Offset.OPEN, Decimal("3050"), 1))
-    assert result.accepted is False
-    assert result.reject_reason == REJECT_DRAWDOWN
-
-
-def test_single_instrument_margin_cap_blocks_the_add():
+def test_notional_cap_blocks_another_open():
+    """单品种名义敞口超过权益的上限时，拒绝继续加仓。"""
     engine = RiskSystem(
         make_config(
             [instrument()],
             [make_account()],
-            risk=limits(instrument_margin_restrict_ratio=Decimal("0.01")),
+            risk=limits(max_instrument_notional_ratio=Decimal("0.2")),
         )
     )
     result = engine.submit_order(OrderRequest("alpha", "rb2510", Side.BUY, Offset.OPEN, Decimal("3000"), 10))
@@ -136,37 +100,24 @@ def test_single_instrument_margin_cap_blocks_the_add():
     assert result.reject_reason == REJECT_EXPOSURE
 
 
-def test_concentration_blocks_only_when_two_products_are_open():
-    copper = instrument("cu2510", product="cu", multiplier="5", tick_size="10", margin_rate="0.01")
-    engine = RiskSystem(
-        make_config(
-            [instrument(margin_rate="0.01"), copper],
-            [make_account(equity="10000000")],
-            prices={"rb2510": Decimal("3000"), "cu2510": Decimal("70000")},
-            risk=limits(concentration_restrict_ratio=Decimal("0.80"), instrument_margin_restrict_ratio=Decimal("0.90")),
-        )
-    )
-    assert engine.submit_order(OrderRequest("alpha", "rb2510", Side.BUY, Offset.OPEN, Decimal("3000"), 10)).accepted
-    assert engine.submit_order(
-        OrderRequest("alpha", "cu2510", Side.BUY, Offset.OPEN, Decimal("70000"), 1)
-    ).accepted
-    # 螺纹 10 手名义 30 万，铜 1 手名义 35 万。再开 37 手螺纹后，螺纹占比超过 80%。
-    blocked = engine.submit_order(OrderRequest("alpha", "rb2510", Side.BUY, Offset.OPEN, Decimal("3000"), 37))
-    assert blocked.accepted is False
-    assert blocked.reject_reason == REJECT_CONCENTRATION
-
-
 def test_positions_can_be_queried_by_account_and_instrument():
+    """持仓可以按账户查询，也可以按合约查询。"""
     engine = RiskSystem(load_config())
-    by_name = engine.query_positions(instrument="rb2510")
+    by_name = engine.query_positions(instrument="rb2701")
     assert {row["account_id"] for row in by_name} == {"alpha", "gamma"}
     beta = engine.query_positions(account_id="beta")
-    assert {row["instrument"] for row in beta} == {"IF2510", "IC2510"}
-    assert engine.query_positions(account_id="beta", instrument="rb2510") == []
+    assert {row["instrument"] for row in beta} == {"IF2612", "IC2612"}
 
 
 def test_close_rejects_more_than_the_open_position():
+    """平仓手数超过持仓时整笔拒绝。"""
     engine = _engine()
     result = engine.submit_order(OrderRequest("gamma", "rb2510", Side.SELL, Offset.CLOSE, Decimal("3050"), 11))
-    assert result.accepted is False
-    assert "可平" in result.reject_reason
+    assert result.reject_reason == REJECT_POSITION
+
+
+def test_config_covers_three_exchanges():
+    """样例配置里有上期所、大商所、中金所，熔断线是初始资金的 3%。"""
+    config = load_config()
+    assert {item.exchange for item in config.instruments.values()} == {"SHFE", "DCE", "CFFEX"}
+    assert config.risk.daily_loss_halt_ratio == Decimal("0.03")

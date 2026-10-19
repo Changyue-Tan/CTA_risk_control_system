@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
@@ -21,45 +21,27 @@ class Offset(str, Enum):
     CLOSE = "close"
 
 
-class ActionLevel(str, Enum):
-    ALERT = "alert"
-    RESTRICT = "restrict"
-    HALT = "halt"
-    RECOVERY = "recovery"
-
-
 def money(value: Decimal) -> str:
     return format(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")
 
 
-def ratio_text(value: Decimal) -> str:
-    return format(value.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP), "f")
-
-
-def pct(value: Decimal) -> str:
-    points = (value * Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return format(points, "f") + "%"
-
-
-def position_direction(side: PositionSide) -> Decimal:
+def direction(side: PositionSide) -> Decimal:
     return Decimal(1) if side == PositionSide.LONG else Decimal(-1)
 
 
 def mtm_pnl(side: PositionSide, price: Decimal, basis: Decimal, qty: int, multiplier: Decimal) -> Decimal:
-    """盯市盈亏。多头 (价-基准)*手数*乘数，空头相反。
+    """盯市盈亏。多头为 (价 - 基准) × 手数 × 乘数，空头相反。
 
-    基准价：今仓用开仓价，昨仓用上一交易日结算价。调用方把基准放在 basis 里。
+    今仓的基准是开仓价，昨仓的基准是上一交易日结算价。
     """
-    return (price - basis) * qty * multiplier * position_direction(side)
+    return (price - basis) * qty * multiplier * direction(side)
 
 
 @dataclass(frozen=True)
 class InstrumentSpec:
     instrument_id: str
     exchange: str
-    product: str
     multiplier: Decimal
-    tick_size: Decimal
     margin_rate: Decimal
     commission_per_lot: Decimal
 
@@ -73,14 +55,10 @@ class AccountSpec:
 
 @dataclass(frozen=True)
 class RiskLimits:
-    daily_loss_circuit_breaker_ratio: Decimal
-    daily_loss_alert_ratio: Decimal
-    max_drawdown_alert_ratio: Decimal
-    max_drawdown_restrict_ratio: Decimal
-    instrument_margin_alert_ratio: Decimal
-    instrument_margin_restrict_ratio: Decimal
-    concentration_alert_ratio: Decimal
-    concentration_restrict_ratio: Decimal
+    # 当日盯市亏损达到初始资金的这个比例时熔断。
+    daily_loss_halt_ratio: Decimal
+    # 单品种名义本金 / 权益 达到这个比例时，禁止继续加该品种。
+    max_instrument_notional_ratio: Decimal
 
 
 @dataclass(frozen=True)
@@ -92,14 +70,6 @@ class BootstrapPosition:
     prev_settle: Decimal
 
 
-@dataclass(frozen=True)
-class SimulatorConfig:
-    enabled: bool
-    interval_ms: int
-    seed: int
-    drop_primary_every: int
-
-
 @dataclass
 class SystemConfig:
     trading_day: date
@@ -108,7 +78,6 @@ class SystemConfig:
     risk: RiskLimits
     bootstrap_positions: list[BootstrapPosition]
     reference_prices: dict[str, Decimal]
-    simulator: SimulatorConfig
 
 
 @dataclass(frozen=True)
@@ -118,22 +87,7 @@ class Tick:
     exchange_ts: datetime
     seq: int
     last: Decimal
-    bid: Decimal
-    ask: Decimal
-    volume: int
     trading_day: date
-
-
-@dataclass
-class IngestResult:
-    applied: bool
-    duplicate: bool
-    stale: bool
-    gap_detected: bool
-    disagreement: bool
-    buffered: bool
-    missing_from: int | None = None
-    missing_to: int | None = None
 
 
 @dataclass
@@ -144,8 +98,6 @@ class OrderRequest:
     offset: Offset
     price: Decimal
     qty: int
-    trading_day: date | None = None
-    ts: datetime | None = None
 
 
 @dataclass
@@ -156,34 +108,6 @@ class OrderResult:
     fill_price: Decimal | None
     fill_qty: int
     realized_pnl: Decimal
-
-
-@dataclass
-class RejectRecord:
-    ts: datetime
-    trading_day: date
-    account_id: str
-    instrument: str
-    side: str
-    offset: str
-    qty: int
-    reason: str
-
-
-@dataclass
-class Trade:
-    trade_id: str
-    order_id: str
-    account_id: str
-    instrument: str
-    side: Side
-    offset: Offset
-    price: Decimal
-    qty: int
-    realized_pnl: Decimal
-    commission: Decimal
-    trading_day: date
-    ts: datetime
 
 
 @dataclass
@@ -204,54 +128,12 @@ class AccountState:
     prev_equity: Decimal
     realized_pnl: Decimal = Decimal(0)
     commission: Decimal = Decimal(0)
-    peak_equity: Decimal = Decimal(0)
     halted: bool = False
-    halt_reason: str = ""
 
 
 @dataclass
 class RiskEvent:
     event_id: str
-    ts: datetime
-    trading_day: date
     account_id: str
     rule_id: str
-    level: ActionLevel
-    instrument: str | None
     message: str
-    value: str
-
-
-@dataclass
-class AccountMetrics:
-    equity: Decimal
-    available: Decimal
-    daily_mtm: Decimal
-    daily_mtm_ratio: Decimal
-    drawdown: Decimal
-    margin: Decimal
-    margin_ratio: Decimal
-    floating: Decimal
-    realized: Decimal
-    commission: Decimal
-    concentration: Decimal
-    instrument_count: int
-    margin_by_instrument: dict[str, Decimal] = field(default_factory=dict)
-    notional_by_instrument: dict[str, Decimal] = field(default_factory=dict)
-
-
-@dataclass
-class PositionView:
-    account_id: str
-    instrument: str
-    exchange: str
-    product: str
-    side: PositionSide
-    qty: int
-    open_price: Decimal
-    prev_settle: Decimal
-    last: Decimal
-    multiplier: Decimal
-    floating_pnl: Decimal
-    margin: Decimal
-    notional: Decimal
