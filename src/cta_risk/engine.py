@@ -497,6 +497,8 @@ class RiskSystem:
         account = self.accounts[account_id]
         lines, position_pnl, margin = self._settlement_lines(account_id, prices)
         equity = account.prev_equity + account.realized_pnl + position_pnl - account.commission
+        daily_pnl = account.realized_pnl + position_pnl - account.commission
+        initial = account.spec.initial_equity
         row = {
             "account_id": account_id,
             "name": account.spec.name,
@@ -506,6 +508,9 @@ class RiskSystem:
             "equity": money(equity),
             "margin": money(margin),
             "available": money(equity - margin),
+            # 风险度 = 保证金 / 权益；当日盈亏比 = 当日净盈亏 / 初始资金。
+            "risk_ratio": format(margin / equity, "f") if equity > 0 else "0",
+            "daily_pnl_ratio": format(daily_pnl / initial, "f") if initial else "0",
             "halted": account.halted,
             "positions": lines,
         }

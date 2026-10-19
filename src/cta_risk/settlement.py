@@ -8,6 +8,8 @@
 - 手续费：今日开平仓手续费合计
 - 权益：上日权益 + 平仓盯市 + 持仓盯市 − 手续费
 - 保证金：按结算价占用的保证金；可用 = 权益 − 保证金
+- 风险度：保证金 / 权益
+- 当日盈亏比：当日净盈亏 / 初始资金
 - 基准 / 结算：该笔持仓的盯市起点价，以及今日用于盯市的结算价
 """
 
@@ -25,6 +27,10 @@ def write_report(path, day: str, rows: list[dict]) -> None:
             f"手续费 {row['commission']}  权益 {row['equity']}"
         )
         lines.append(f"  保证金 {row['margin']}  可用 {row['available']}")
+        lines.append(
+            f"  风险度 {row.get('risk_ratio', '0')}  "
+            f"当日盈亏比 {row.get('daily_pnl_ratio', '0')}"
+        )
         if not row["positions"]:
             lines.append("  持仓  （空仓）")
         for pos in row["positions"]:

@@ -149,6 +149,7 @@
       post(`/api/accounts/${document.querySelector("#account").value || "gamma"}/resume`);
     });
     refresh();
+    setInterval(refresh, 2000);
   </script>
 </body>
 </html>
