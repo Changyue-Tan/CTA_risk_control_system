@@ -39,12 +39,11 @@ from cta_risk.models import (
     SystemConfig,
     Tick,
     money,
-    mtm_pnl,
     pct,
     position_side_to_close,
 )
 from cta_risk.positions import PositionBook
-from cta_risk.settlement import write_report
+from cta_risk.settlement import settle_accounts
 
 logger = logging.getLogger("cta_risk.engine")
 
@@ -458,64 +457,9 @@ class RiskSystem:
             }
 
     def settle(self, prices: dict[str, Decimal]) -> dict:
-        """逐日盯市（mark-to-market）清算。
-
-        对每个账户：用今日结算价给未平仓计持仓盯市，加上今日已平仓盯市，
-        扣手续费得到结算权益；然后把留仓基准改成今日结算价，交易日 +1，
-        当日盈亏计数器清零——下一交易日的浮盈从新的「昨结算」起算。
-        """
+        """逐日盯市清算。具体计算见 `settlement.settle_accounts`。"""
         with self._lock:
-            missing = sorted({lot.instrument for lot in self.positions.lots} - set(prices))
-            if missing:
-                raise ValueError(f"缺少结算价: {missing}")
-            day = self.trading_day
-            rows = []
-            firm_equity = Decimal(0)
-            for account_id in sorted(self.accounts):
-                row, equity = self._settle_account(account_id, prices)
-                rows.append(row)
-                firm_equity += equity
-            for instrument, price in prices.items():
-                if instrument in self.market.last:
-                    self.market.set_settlement_price(instrument, price)
-            self.trading_day = day + timedelta(days=1)
-            path = self.report_dir / f"risk_report_{day.strftime('%Y%m%d')}.txt"
-            write_report(path, day.isoformat(), rows)
-            logger.info("完成 %s 清算，公司权益 %s", day.isoformat(), money(firm_equity))
-            return {
-                "trading_day": day.isoformat(),
-                "text_path": str(path),
-                "firm_equity": money(firm_equity),
-                "accounts": rows,
-            }
-
-    def _settle_account(self, account_id: str, prices: dict[str, Decimal]) -> tuple[dict, Decimal]:
-        """清算一个账户并滚入下一交易日。
-
-        结算权益 = 上日权益 + 平仓盯市 + 持仓盯市 − 手续费
-        """
-        account = self.accounts[account_id]
-        lines, position_pnl, margin = self._settlement_lines(account_id, prices)
-        equity = account.prev_equity + account.realized_pnl + position_pnl - account.commission
-        daily_pnl = account.realized_pnl + position_pnl - account.commission
-        initial = account.spec.initial_equity
-        row = {
-            "account_id": account_id,
-            "name": account.spec.name,
-            "close_pnl": money(account.realized_pnl),
-            "position_pnl": money(position_pnl),
-            "commission": money(account.commission),
-            "equity": money(equity),
-            "margin": money(margin),
-            "available": money(equity - margin),
-            # 风险度 = 保证金 / 权益；当日盈亏比 = 当日净盈亏 / 初始资金。
-            "risk_ratio": format(margin / equity, "f") if equity > 0 else "0",
-            "daily_pnl_ratio": format(daily_pnl / initial, "f") if initial else "0",
-            "halted": account.halted,
-            "positions": lines,
-        }
-        self._roll_to_next_day(account, prices, equity)
-        return row, equity
+            return settle_accounts(self, prices)
 
     def last_prices(self) -> dict[str, Decimal]:
         return {name: tick.last for name, tick in self.market.last.items()}
@@ -534,42 +478,6 @@ class RiskSystem:
             "margin": money(metrics.margin),
             "halted": account.halted,
         }
-
-    def _settlement_lines(self, account_id: str, prices: dict[str, Decimal]) -> tuple[list[dict], Decimal, Decimal]:
-        """按结算价给每笔留仓算持仓盯市和保证金，并生成日报持仓明细。"""
-        position_pnl = Decimal(0)
-        margin = Decimal(0)
-        lines = []
-        for lot in self.positions.lots_of(account_id):
-            spec = self.config.instruments[lot.instrument]
-            settle_px = prices[lot.instrument]
-            # 相对 lot 当前盯市基准（昨结算或今开仓价）盯到今日结算价。
-            pnl = mtm_pnl(lot.side, settle_px, lot.mtm_basis, lot.qty, spec.multiplier)
-            gross = settle_px * lot.qty * spec.multiplier
-            position_pnl += pnl
-            margin += gross * spec.margin_rate
-            lines.append(
-                {
-                    "instrument": lot.instrument,
-                    "side": lot.side.value,
-                    "qty": lot.qty,
-                    "basis": money(lot.mtm_basis),
-                    "settle": money(settle_px),
-                    "pnl": money(pnl),
-                    "notional": money(gross),
-                }
-            )
-        return lines, position_pnl, margin
-
-    def _roll_to_next_day(self, account: AccountState, prices: dict[str, Decimal], equity: Decimal) -> None:
-        """日终滚存：留仓基准 ← 今日结算价；当日盈亏/手续费清零；权益成为明日的上日权益。"""
-        for lot in self.positions.lots_of(account.spec.account_id):
-            lot.mtm_basis = prices[lot.instrument]
-        account.prev_equity = equity
-        if equity > account.peak_equity:
-            account.peak_equity = equity
-        account.realized_pnl = Decimal(0)
-        account.commission = Decimal(0)
 
     def _margin(self, account_id: str) -> Decimal:
         """保证金 = Σ 最新价 × 手数 × 乘数 × 保证金率。"""
