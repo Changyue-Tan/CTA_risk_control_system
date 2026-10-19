@@ -34,4 +34,4 @@ pixi run serve      # 监控台 http://127.0.0.1:8000
 
 风控动作分三级：告警、限制下单、熔断。阈值（当日亏损、最大回撤、集中度、名义敞口）写在 `config/system.yaml`。
 
-设计说明见 `docs/设计说明.md`，测试对应关系见 `docs/测试方案.md`。
+不熟悉期货清算时，先看 `docs/设计说明.md` 的术语表，再读 `src/cta_risk/models.py` 顶部说明。测试对应关系见 `docs/测试方案.md`。

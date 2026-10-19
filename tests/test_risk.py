@@ -13,9 +13,9 @@ from cta_risk.engine import (
     REJECT_HALT,
     REJECT_POSITION,
     RiskSystem,
-    three_percent_price,
+    halt_price_at_loss_limit,
 )
-from cta_risk.models import ActionLevel, BootstrapPosition, Offset, OrderRequest, PositionSide, Side, Tick
+from cta_risk.models import ActionLevel, Offset, OrderRequest, PositionSide, PriorPosition, Side, Tick
 from tests.conftest import instrument, limits, make_account, make_config
 
 
@@ -24,7 +24,7 @@ def _engine():
         make_config(
             [instrument()],
             [make_account("gamma", "1000000")],
-            positions=[BootstrapPosition("gamma", "rb2510", PositionSide.LONG, 10, Decimal("3050"))],
+            positions=[PriorPosition("gamma", "rb2510", PositionSide.LONG, 10, Decimal("3050"))],
             prices={"rb2510": Decimal("3050")},
         )
     )
@@ -64,7 +64,7 @@ def test_same_tick_from_backup_does_not_emit_a_second_halt():
     engine.on_tick(Tick("backup", "rb2510", ts, 1, Decimal("2750"), engine.trading_day))
     halts = [event for event in engine.events if event.rule_id == HALT_RULE]
     assert len(halts) == 1
-    assert engine.market.applied == 1
+    assert engine.market.applied_count == 1
 
 
 def test_halt_stays_until_resume():
@@ -83,7 +83,7 @@ def test_halt_stays_until_resume():
 def test_accounts_stay_separate_and_gamma_halts_at_three_percent():
     """同一笔螺纹行情只熔断 Gamma。价格比昨结算低 150 点时，亏损正好是初始资金的 3%。"""
     engine = RiskSystem(load_config())
-    instrument, price = three_percent_price(engine.config)
+    instrument, price = halt_price_at_loss_limit(engine.config)
     engine.set_price(instrument, price)
     assert instrument == "rb2701"
     assert price == Decimal("2930")
@@ -161,7 +161,7 @@ def test_drawdown_restrict_blocks_open():
         make_config(
             [instrument()],
             [make_account("alpha", "1000000")],
-            positions=[BootstrapPosition("alpha", "rb2510", PositionSide.LONG, 10, Decimal("3000"))],
+            positions=[PriorPosition("alpha", "rb2510", PositionSide.LONG, 10, Decimal("3000"))],
             prices={"rb2510": Decimal("3000")},
             risk=limits(
                 daily_loss_alert_ratio=Decimal("0.5"),
@@ -188,8 +188,8 @@ def test_concentration_restrict_blocks_add_on_top_instrument():
             ],
             [make_account("alpha", "1000000")],
             positions=[
-                BootstrapPosition("alpha", "rb2510", PositionSide.LONG, 20, Decimal("3000")),
-                BootstrapPosition("alpha", "i2601", PositionSide.LONG, 1, Decimal("700")),
+                PriorPosition("alpha", "rb2510", PositionSide.LONG, 20, Decimal("3000")),
+                PriorPosition("alpha", "i2601", PositionSide.LONG, 1, Decimal("700")),
             ],
             prices={"rb2510": Decimal("3000"), "i2601": Decimal("700")},
             risk=limits(max_instrument_notional_ratio=Decimal("10")),

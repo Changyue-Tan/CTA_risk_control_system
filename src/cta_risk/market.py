@@ -19,21 +19,24 @@ class MarketHub:
     def __init__(self) -> None:
         self.last: dict[str, Tick] = {}
         self.tape: list[Tick] = []
-        self.applied = 0
-        self.duplicates = 0
-        self.stale = 0
-        self.gaps = 0
-        self.filled = 0
+        # 统计计数器（带 _count 后缀），用于断线回补和去重的演示验证。
+        self.applied_count = 0
+        self.duplicate_count = 0
+        self.stale_count = 0
+        self.gap_count = 0
+        self.filled_count = 0
         self._seq: dict[tuple[str, str], int] = {}
         self._buffer: dict[tuple[str, str], dict[int, Tick]] = {}
         self._seen_ts: set[tuple[str, datetime]] = set()
 
-    def seed(self, instrument: str, price: Decimal, trading_day: date) -> None:
+    def seed_reference_price(self, instrument: str, price: Decimal, trading_day: date) -> None:
+        """开盘前用参考价（通常是昨结算）给最新价占位。"""
         ts = datetime.combine(trading_day, time(0, 0), tzinfo=BEIJING)
         self.last[instrument] = Tick("参考价", instrument, ts, 0, price, trading_day)
         self._seen_ts.add((instrument, ts))
 
-    def mark(self, instrument: str, price: Decimal) -> None:
+    def set_settlement_price(self, instrument: str, price: Decimal) -> None:
+        """日终清算时，把最新价改成结算价（保留原行情时间戳）。"""
         current = self.last[instrument]
         self.last[instrument] = Tick(
             current.source,
@@ -56,11 +59,11 @@ class MarketHub:
         key = (tick.source, tick.instrument)
         expected = self._seq.get(key, 0) + 1
         if tick.seq < expected or tick.seq < 1:
-            self.duplicates += 1
+            self.duplicate_count += 1
             return False
         if tick.seq > expected:
             self._buffer.setdefault(key, {})[tick.seq] = tick
-            self.gaps += 1
+            self.gap_count += 1
             return False
         return True
 
@@ -71,7 +74,7 @@ class MarketHub:
         nxt = tick.seq + 1
         while nxt in pending:
             changed = self._move_last_price(pending.pop(nxt)) or changed
-            self.filled += 1
+            self.filled_count += 1
             nxt += 1
         return changed
 
@@ -81,16 +84,16 @@ class MarketHub:
         self.tape.append(tick)
         current = self.last.get(tick.instrument)
         if current is not None and tick.exchange_ts < current.exchange_ts:
-            self.stale += 1
+            self.stale_count += 1
             return False
         stamp = (tick.instrument, tick.exchange_ts)
         if stamp in self._seen_ts:
-            self.duplicates += 1
+            self.duplicate_count += 1
             return False
         self._seen_ts.add(stamp)
         self.last[tick.instrument] = tick
         if current is None or tick.last != current.last:
-            self.applied += 1
+            self.applied_count += 1
             return True
         return False
 
@@ -113,17 +116,17 @@ def demonstrate_gap() -> dict:
     for seq in (4, 5, 6):
         hub.ingest(tick("backup", seq))
     hub.ingest(tick("primary", 6))
-    before = hub.applied
+    before = hub.applied_count
     # 主源补上 4、5 后放行缓存的 6。这三笔时间都更早，价格保持 3456。
     hub.ingest(tick("primary", 4))
     hub.ingest(tick("primary", 5))
     return {
-        "applied": hub.applied,
+        "applied": hub.applied_count,
         "applied_before_replay": before,
-        "duplicates": hub.duplicates,
-        "stale": hub.stale,
-        "gaps": hub.gaps,
-        "filled": hub.filled,
+        "duplicates": hub.duplicate_count,
+        "stale": hub.stale_count,
+        "gaps": hub.gap_count,
+        "filled": hub.filled_count,
         "last": hub.last[instrument].last,
         "primary_seqs": [item.seq for item in hub.tape if item.source == "primary"],
     }

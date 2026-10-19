@@ -57,4 +57,4 @@ def test_close_uses_fifo_and_the_older_basis(tmp_path):
     assert closed.realized_pnl == Decimal("10000")
     rows = engine.query_positions(account_id="alpha", instrument="rb2510")
     assert rows[0]["qty"] == 5
-    assert Decimal(rows[0]["prev_settle"]) == Decimal("3100")
+    assert Decimal(rows[0]["mtm_basis"]) == Decimal("3100")

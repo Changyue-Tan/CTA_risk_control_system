@@ -41,7 +41,7 @@ def test_day_session_close_is_newer_than_the_reference_price():
     """参考价放在北京时间 0 点，所以当天 15:00 的股指收盘可以覆盖它。"""
     hub = MarketHub()
     day = datetime(2026, 10, 19, tzinfo=BEIJING).date()
-    hub.seed("IF2612", Decimal("4076.4"), day)
+    hub.seed_reference_price("IF2612", Decimal("4076.4"), day)
     close = datetime(2026, 10, 19, 15, 0, tzinfo=BEIJING)
     assert hub.ingest(Tick("新浪", "IF2612", close, 1, Decimal("4110.4"), day)) is True
     assert hub.last["IF2612"].last == Decimal("4110.4")

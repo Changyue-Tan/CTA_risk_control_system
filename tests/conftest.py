@@ -49,6 +49,6 @@ def make_config(instruments, accounts, positions=None, prices=None, risk: RiskLi
         instruments=book,
         accounts=accounts,
         risk=risk or limits(),
-        bootstrap_positions=positions or [],
+        prior_positions=positions or [],
         reference_prices=prices,
     )

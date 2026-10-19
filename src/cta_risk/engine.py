@@ -1,3 +1,16 @@
+"""风控与清算引擎。
+
+数据流：行情 → `MarketHub` 合成最新价 → 持仓浮盈变化 → `_evaluate_risk`；
+委托 → `_cannot_open` / `_cannot_close` → `_fill` → 再评估风险；
+收盘 → `settle` 逐日盯市并写出日报。
+
+盘中权益（账户净值）怎么算：
+
+    权益 = 上日权益 + 今日已平仓盯市 + 持仓浮盈 − 手续费
+    当日盯市 = 今日已平仓盯市 + 持仓浮盈          # 熔断口径，不含手续费
+    可用资金 = 权益 − 保证金
+"""
+
 from __future__ import annotations
 
 import logging
@@ -26,6 +39,7 @@ from cta_risk.models import (
     money,
     mtm_pnl,
     pct,
+    position_side_to_close,
 )
 from cta_risk.positions import PositionBook
 from cta_risk.settlement import write_report
@@ -46,18 +60,28 @@ REJECT_EXPOSURE = "单品种名义敞口超限，禁止继续加仓"
 REJECT_MARGIN = "可用资金不足，禁止开仓"
 REJECT_POSITION = "可平仓位不足"
 
+# set_price 模拟行情时用的数据源名（熔断验收按钮、演示脚本走这条路）。
+ACCEPTANCE_SOURCE = "验收"
+
 
 @dataclass
 class Metrics:
+    """账户盘中指标快照。"""
+
+    # 账户净值。
     equity: Decimal
+    # 当日盯市盈亏（已平仓 + 浮盈，不含手续费）。熔断按它相对初始资金判断。
     daily_mtm: Decimal
+    # 持仓占用的保证金。
     margin: Decimal
+    # 还能用来开新仓的资金 = equity − margin。
     available: Decimal
+    # 相对历史权益高水位的回撤比例，0.10 表示回撤了 10%。
     drawdown: Decimal
 
 
 class RiskSystem:
-    """行情、持仓、熔断和日终清算。所有改动都先拿到同一把锁。"""
+    """行情接入、持仓成交、三级风控与日终清算。所有状态改动都先拿同一把锁。"""
 
     def __init__(self, config: SystemConfig, report_dir: Path | None = None) -> None:
         self.config = config
@@ -73,13 +97,13 @@ class RiskSystem:
         self.report_dir.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
         self._ids = count(1)
-        self._scenario_seq: dict[str, int] = {}
+        self._quote_seq: dict[tuple[str, str], int] = {}
         self._active: set[tuple[str, str, str]] = set()
 
         for instrument, price in config.reference_prices.items():
-            self.market.seed(instrument, price, self.trading_day)
-        for position in config.bootstrap_positions:
-            self.positions.bootstrap(position, self.trading_day, self._next("L"))
+            self.market.seed_reference_price(instrument, price, self.trading_day)
+        for position in config.prior_positions:
+            self.positions.load_prior_positions(position, self.trading_day, self._next("L"))
         self._evaluate_risk()
 
     def on_tick(self, tick: Tick) -> bool:
@@ -95,9 +119,9 @@ class RiskSystem:
         for quote in quotes:
             if quote.instrument not in self.config.instruments:
                 continue
-            key = f"{quote.source}:{quote.instrument}"
-            seq = self._scenario_seq.get(key, 0) + 1
-            self._scenario_seq[key] = seq
+            key = (quote.source, quote.instrument)
+            seq = self._quote_seq.get(key, 0) + 1
+            self._quote_seq[key] = seq
             tick = Tick(quote.source, quote.instrument, quote.exchange_ts, seq, quote.last, self.trading_day)
             if self.on_tick(tick):
                 changed += 1
@@ -106,11 +130,11 @@ class RiskSystem:
     def set_price(self, instrument: str, price: Decimal) -> None:
         """把某个合约的最新价直接设成给定价格，并重新检查熔断。"""
         current = self.market.last[instrument]
-        seq = self._scenario_seq.get(instrument, 0) + 1
-        self._scenario_seq[instrument] = seq
+        seq = self._quote_seq.get((ACCEPTANCE_SOURCE, instrument), 0) + 1
+        self._quote_seq[(ACCEPTANCE_SOURCE, instrument)] = seq
         self.on_tick(
             Tick(
-                "验收",
+                ACCEPTANCE_SOURCE,
                 instrument,
                 current.exchange_ts + timedelta(seconds=1),
                 seq,
@@ -147,13 +171,14 @@ class RiskSystem:
         return self._cannot_open(order)
 
     def _cannot_close(self, order: OrderRequest) -> str | None:
-        side = PositionSide.LONG if order.side == Side.SELL else PositionSide.SHORT
+        side = position_side_to_close(order.side)
         held = self.positions.qty(order.account_id, order.instrument, side)
         if held < order.qty:
             return REJECT_POSITION
         return None
 
     def _cannot_open(self, order: OrderRequest) -> str | None:
+        """开仓前置检查。顺序：熔断 → 回撤 → 集中度 → 单品种名义敞口 → 可用资金。"""
         account = self.accounts[order.account_id]
         if account.halted:
             return REJECT_HALT
@@ -163,6 +188,7 @@ class RiskSystem:
             return REJECT_MARGIN
         if metrics.drawdown >= self.config.risk.max_drawdown_restrict_ratio:
             return REJECT_DRAWDOWN
+        # 集中度：只拦「已经是最大敞口」的那个品种继续加仓；至少持有两个品种才评估。
         notionals = self._notionals(order.account_id)
         if len(notionals) >= 2:
             top, share = self._top_share(notionals)
@@ -205,6 +231,7 @@ class RiskSystem:
         return OrderResult(True, self._next("O"), None, order.price, order.qty, realized)
 
     def _open_lot(self, order: OrderRequest) -> None:
+        """今仓：盯市基准先等于开仓价；日终清算后会被改写成今日结算价。"""
         side = PositionSide.LONG if order.side == Side.BUY else PositionSide.SHORT
         self.positions.lots.append(
             OpenLot(
@@ -215,7 +242,7 @@ class RiskSystem:
                 qty=order.qty,
                 open_price=order.price,
                 open_day=self.trading_day,
-                prev_settle=order.price,
+                mtm_basis=order.price,
             )
         )
 
@@ -359,6 +386,7 @@ class RiskSystem:
             return account.halted
 
     def metrics(self, account_id: str) -> Metrics:
+        """按最新价重算账户净值、当日盯市、保证金、回撤。"""
         account = self.accounts[account_id]
         floating = self.positions.floating(account_id, self._price_of, self.config.instruments)
         margin = self._margin(account_id)
@@ -367,7 +395,8 @@ class RiskSystem:
             account.peak_equity = equity
         peak = account.peak_equity
         drawdown = (peak - equity) / peak if peak > 0 else Decimal(0)
-        return Metrics(equity, account.realized_pnl + floating, margin, equity - margin, drawdown)
+        daily_mtm = account.realized_pnl + floating
+        return Metrics(equity, daily_mtm, margin, equity - margin, drawdown)
 
     def query_positions(self, account_id: str | None = None, instrument: str | None = None) -> list[dict]:
         with self._lock:
@@ -395,7 +424,12 @@ class RiskSystem:
             }
 
     def settle(self, prices: dict[str, Decimal]) -> dict:
-        """逐日盯市。结算后，留仓的基准价改为今日结算价。"""
+        """逐日盯市（mark-to-market）清算。
+
+        对每个账户：用今日结算价给未平仓计持仓盯市，加上今日已平仓盯市，
+        扣手续费得到结算权益；然后把留仓基准改成今日结算价，交易日 +1，
+        当日盈亏计数器清零——下一交易日的浮盈从新的「昨结算」起算。
+        """
         with self._lock:
             missing = sorted({lot.instrument for lot in self.positions.lots} - set(prices))
             if missing:
@@ -409,7 +443,7 @@ class RiskSystem:
                 firm_equity += equity
             for instrument, price in prices.items():
                 if instrument in self.market.last:
-                    self.market.mark(instrument, price)
+                    self.market.set_settlement_price(instrument, price)
             self.trading_day = day + timedelta(days=1)
             path = self.report_dir / f"risk_report_{day.strftime('%Y%m%d')}.txt"
             write_report(path, day.isoformat(), rows)
@@ -422,7 +456,10 @@ class RiskSystem:
             }
 
     def _settle_account(self, account_id: str, prices: dict[str, Decimal]) -> tuple[dict, Decimal]:
-        """清算一个账户：按结算价盯市，再把留仓基准改成今日结算价。"""
+        """清算一个账户并滚入下一交易日。
+
+        结算权益 = 上日权益 + 平仓盯市 + 持仓盯市 − 手续费
+        """
         account = self.accounts[account_id]
         lines, position_pnl, margin = self._settlement_lines(account_id, prices)
         equity = account.prev_equity + account.realized_pnl + position_pnl - account.commission
@@ -460,13 +497,15 @@ class RiskSystem:
         }
 
     def _settlement_lines(self, account_id: str, prices: dict[str, Decimal]) -> tuple[list[dict], Decimal, Decimal]:
+        """按结算价给每笔留仓算持仓盯市和保证金，并生成日报持仓明细。"""
         position_pnl = Decimal(0)
         margin = Decimal(0)
         lines = []
         for lot in self.positions.lots_of(account_id):
             spec = self.config.instruments[lot.instrument]
             settle_px = prices[lot.instrument]
-            pnl = mtm_pnl(lot.side, settle_px, lot.prev_settle, lot.qty, spec.multiplier)
+            # 相对 lot 当前盯市基准（昨结算或今开仓价）盯到今日结算价。
+            pnl = mtm_pnl(lot.side, settle_px, lot.mtm_basis, lot.qty, spec.multiplier)
             gross = settle_px * lot.qty * spec.multiplier
             position_pnl += pnl
             margin += gross * spec.margin_rate
@@ -475,7 +514,7 @@ class RiskSystem:
                     "instrument": lot.instrument,
                     "side": lot.side.value,
                     "qty": lot.qty,
-                    "basis": money(lot.prev_settle),
+                    "basis": money(lot.mtm_basis),
                     "settle": money(settle_px),
                     "pnl": money(pnl),
                     "notional": money(gross),
@@ -484,8 +523,9 @@ class RiskSystem:
         return lines, position_pnl, margin
 
     def _roll_to_next_day(self, account: AccountState, prices: dict[str, Decimal], equity: Decimal) -> None:
+        """日终滚存：留仓基准 ← 今日结算价；当日盈亏/手续费清零；权益成为明日的上日权益。"""
         for lot in self.positions.lots_of(account.spec.account_id):
-            lot.prev_settle = prices[lot.instrument]
+            lot.mtm_basis = prices[lot.instrument]
         account.prev_equity = equity
         if equity > account.peak_equity:
             account.peak_equity = equity
@@ -493,6 +533,7 @@ class RiskSystem:
         account.commission = Decimal(0)
 
     def _margin(self, account_id: str) -> Decimal:
+        """保证金 = Σ 最新价 × 手数 × 乘数 × 保证金率。"""
         total = Decimal(0)
         for lot in self.positions.lots_of(account_id):
             spec = self.config.instruments[lot.instrument]
@@ -500,6 +541,7 @@ class RiskSystem:
         return total
 
     def _notionals(self, account_id: str) -> dict[str, Decimal]:
+        """按合约汇总名义本金，供集中度计算。"""
         result: dict[str, Decimal] = {}
         for lot in self.positions.lots_of(account_id):
             spec = self.config.instruments[lot.instrument]
@@ -508,6 +550,7 @@ class RiskSystem:
         return result
 
     def _top_share(self, notionals: dict[str, Decimal]) -> tuple[str | None, Decimal]:
+        """返回名义本金最大的合约及其占总敞口的比例。"""
         total = sum(notionals.values(), Decimal(0))
         if total <= 0 or not notionals:
             return None, Decimal(0)
@@ -521,9 +564,13 @@ class RiskSystem:
         return f"{prefix}{next(self._ids):06d}"
 
 
-def three_percent_price(config: SystemConfig, account_id: str = "gamma") -> tuple[str, Decimal]:
-    """返回把该账户打到恰好亏掉初始资金 3% 的合约和价格。按配置里的昨仓计算。"""
-    position = next(item for item in config.bootstrap_positions if item.account_id == account_id)
+def halt_price_at_loss_limit(config: SystemConfig, account_id: str = "gamma") -> tuple[str, Decimal]:
+    """返回把该账户打到恰好触熔断线的合约和价格。按配置里的昨仓反推。
+
+    默认熔断线是初始资金的 3%：20 手螺纹（乘数 10）要亏 3 万，
+    价格需相对昨结算反向移动 150 点。
+    """
+    position = next(item for item in config.prior_positions if item.account_id == account_id)
     spec = config.instruments[position.instrument]
     account = next(item for item in config.accounts if item.account_id == account_id)
     loss = config.risk.daily_loss_halt_ratio * account.initial_equity

@@ -8,9 +8,9 @@ import yaml
 
 from cta_risk.models import (
     AccountSpec,
-    BootstrapPosition,
     InstrumentSpec,
     PositionSide,
+    PriorPosition,
     RiskLimits,
     SystemConfig,
 )
@@ -46,14 +46,14 @@ def load_config(path: Path | None = None) -> SystemConfig:
     ]
     risk = raw["risk"]
     positions = [
-        BootstrapPosition(
+        PriorPosition(
             str(item["account"]),
             str(item["instrument"]),
             PositionSide(str(item["side"])),
             int(item["qty"]),
             _dec(item["prev_settle"]),
         )
-        for item in raw.get("bootstrap_positions", [])
+        for item in raw.get("prior_positions", [])
     ]
     prices = {name: _dec(px) for name, px in raw["reference_prices"].items()}
     missing = set(instruments) - set(prices)
@@ -72,6 +72,6 @@ def load_config(path: Path | None = None) -> SystemConfig:
             concentration_restrict_ratio=_dec(risk["concentration_restrict_ratio"]),
             max_instrument_notional_ratio=_dec(risk["max_instrument_notional_ratio"]),
         ),
-        bootstrap_positions=positions,
+        prior_positions=positions,
         reference_prices=prices,
     )

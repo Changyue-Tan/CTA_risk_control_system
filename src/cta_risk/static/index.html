@@ -102,7 +102,7 @@
       document.querySelector("#positions").innerHTML = data.positions.map((row) => `
         <tr>
           <td>${row.account_id}</td><td>${row.instrument}</td><td>${sideText[row.side] || row.side}</td>
-          <td>${row.qty}</td><td>${row.prev_settle}</td><td>${row.last}</td>
+          <td>${row.qty}</td><td>${row.mtm_basis}</td><td>${row.last}</td>
           <td class="${cls(row.floating_pnl)}">${money(row.floating_pnl)}</td>
         </tr>`).join("");
       document.querySelector("#events").innerHTML = data.events.slice().reverse().map((row) => `

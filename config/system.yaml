@@ -1,5 +1,12 @@
-# 改这个文件即可调整品种、账户和两条风控线。
+# 改这个文件即可调整品种、账户和风控阈值，无需改代码。
 # 交易日和昨结算取 2026-10-19 仍在交易的合约。题目没有指定合约代码。
+#
+# 字段速查：
+#   multiplier          合约乘数。一手盈亏 = 价格变动 × 手数 × 乘数
+#   margin_rate         保证金率。保证金 ≈ 价格 × 手数 × 乘数 × 保证金率
+#   commission_per_lot  每手手续费（开仓、平仓各收一次）
+#   prev_settle         昨结算价，昨仓的盯市基准（仅开盘前的昨仓用这个字段名）
+#   daily_loss_*        当日盯市亏损占初始资金的比例（告警 / 熔断）
 trading_day: "2026-10-19"
 
 instruments:
@@ -49,7 +56,7 @@ risk:
   max_instrument_notional_ratio: "3"
 
 # 昨仓。盯市基准是 2026-10-19 的昨结算价（东财行情 zjsj）。
-bootstrap_positions:
+prior_positions:
   - account: alpha
     instrument: rb2701
     side: long

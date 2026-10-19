@@ -30,5 +30,5 @@ def test_stale_replay_does_not_move_the_market_backward():
     ts = datetime(2026, 7, 3, 10, 0, tzinfo=timezone.utc)
     assert hub.ingest(_tick("primary", 1, "110", ts + timedelta(seconds=1))) is True
     assert hub.ingest(_tick("primary", 2, "50", ts)) is False
-    assert hub.stale == 1
+    assert hub.stale_count == 1
     assert hub.last["rb2510"].last == Decimal("110")

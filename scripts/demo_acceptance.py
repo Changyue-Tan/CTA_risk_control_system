@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from cta_risk.config import load_config
-from cta_risk.engine import RiskSystem, three_percent_price
+from cta_risk.engine import RiskSystem, halt_price_at_loss_limit
 from cta_risk.market import demonstrate_gap
 from cta_risk.models import Offset, OrderRequest, Side
 
@@ -24,7 +24,7 @@ def main() -> None:
 
     print("\n== 单日亏损 3% 熔断 ==")
     engine = RiskSystem(load_config())
-    instrument, price = three_percent_price(engine.config)
+    instrument, price = halt_price_at_loss_limit(engine.config)
     engine.set_price(instrument, price)
     print(f"{instrument} 打到 {price}。Gamma 当日盯市 {engine.metrics('gamma').daily_mtm}，熔断 {_yes(engine.accounts['gamma'].halted)}")
     opened = engine.submit_order(OrderRequest("gamma", instrument, Side.BUY, Offset.OPEN, price, 1))

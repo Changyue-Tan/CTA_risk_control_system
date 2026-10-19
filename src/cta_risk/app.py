@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from cta_risk.config import default_config_path, load_config
-from cta_risk.engine import RiskSystem, order_result_dict, three_percent_price
+from cta_risk.engine import RiskSystem, halt_price_at_loss_limit, order_result_dict
 from cta_risk.models import Offset, OrderRequest, Side, money
 from cta_risk.quotes import fetch_quotes
 
@@ -91,7 +91,7 @@ def create_app(engine: RiskSystem | None = None) -> FastAPI:
     def circuit_breaker(request: Request):
         """把 Gamma 的螺纹打到恰好亏掉初始资金 3% 的价格。20 手、乘数 10 时，价格比昨结算低 150 点。"""
         engine = request.app.state.engine
-        instrument, price = three_percent_price(engine.config)
+        instrument, price = halt_price_at_loss_limit(engine.config)
         engine.set_price(instrument, price)
         metrics = engine.metrics("gamma")
         opened = engine.submit_order(OrderRequest("gamma", instrument, Side.BUY, Offset.OPEN, price, 1))
